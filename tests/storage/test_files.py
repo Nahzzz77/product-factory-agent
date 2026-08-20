@@ -1,11 +1,15 @@
 import errno
+import hashlib
 import json
+import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from product_factory.storage import files
-from product_factory.storage.files import atomic_write_json, contained_path
+from product_factory.storage.files import atomic_write_json, contained_path, read_contained_regular_bytes
 
 
 def test_atomic_json_leaves_complete_document(tmp_path: Path) -> None:
@@ -82,3 +86,98 @@ def test_parent_directory_fsync_keeps_non_windows_permission_error_strict(
         files._fsync_parent_directory(tmp_path / "state.json")
 
     assert caught.value.errno == errno.EACCES
+
+
+def test_fallback_file_snapshot_uses_binary_flags_and_preserves_raw_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    payload = b"CRLF\r\ncontrol\x1a\xff\x00\n"
+    (root / "raw.bin").write_bytes(payload)
+    binary_flag = 0x40000000
+    original_open = files.os.open
+    opened_flags: list[int] = []
+
+    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        opened_flags.append(flags)
+        return original_open(path, flags & ~binary_flag, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "name", "nt")
+    monkeypatch.setattr(files.os, "O_BINARY", binary_flag, raising=False)
+    monkeypatch.setattr(files.os, "open", spy_open)
+
+    snapshot = read_contained_regular_bytes(root, ("raw.bin",))
+    assert snapshot == payload
+    assert hashlib.sha256(snapshot).hexdigest() == hashlib.sha256(payload).hexdigest()
+    assert any(flags & binary_flag for flags in opened_flags)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"),
+    reason="requires POSIX FIFOs and nonblocking open",
+)
+def test_fifo_snapshot_is_rejected_without_blocking(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    os.mkfifo(root / "pipe")
+    result: list[BaseException | None] = []
+
+    def read_fifo() -> None:
+        try:
+            read_contained_regular_bytes(root, ("pipe",))
+        except BaseException as exc:
+            result.append(exc)
+        else:  # pragma: no cover - assertion below explains the failure.
+            result.append(None)
+
+    worker = threading.Thread(target=read_fifo)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 1
+    assert len(result) == 1
+    assert isinstance(result[0], ValueError)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"),
+    reason="requires POSIX FIFOs and nonblocking open",
+)
+def test_fifo_replacement_after_precheck_is_rejected_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    entry = root / "entry"
+    entry.write_bytes(b"regular")
+    original_open = files.os.open
+    replaced = False
+
+    def replace_before_final_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal replaced
+        if not replaced and path == "entry" and "dir_fd" in kwargs:
+            replaced = True
+            entry.unlink()
+            os.mkfifo(entry)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "open", replace_before_final_open)
+    result: list[BaseException | None] = []
+
+    def read_replaced_file() -> None:
+        try:
+            read_contained_regular_bytes(root, ("entry",))
+        except BaseException as exc:
+            result.append(exc)
+        else:  # pragma: no cover - assertion below explains the failure.
+            result.append(None)
+
+    worker = threading.Thread(target=read_replaced_file)
+    started = time.monotonic()
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 1
+    assert isinstance(result[0], ValueError)

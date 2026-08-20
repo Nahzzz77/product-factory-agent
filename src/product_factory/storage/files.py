@@ -56,7 +56,14 @@ def _read_posix_contained_file(root: Path, candidate: Path, parts: tuple[str, ..
             )
             os.close(directory_fd)
             directory_fd = next_fd
-        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        final_before = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(final_before.st_mode):
+            raise ValueError("not a regular file")
+        file_fd = os.open(
+            parts[-1],
+            _file_read_flags() | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
         opened = os.fstat(file_fd)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("not a regular file")
@@ -77,7 +84,7 @@ def _read_fallback_contained_file(root: Path, candidate: Path) -> bytes:
         if stat.S_ISLNK(before.st_mode):
             raise ValueError("symlink is not a regular file")
         _require_contained(root, candidate.resolve(strict=True))
-        descriptor = os.open(candidate, os.O_RDONLY)
+        descriptor = os.open(candidate, _file_read_flags())
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("not a regular file")
@@ -114,6 +121,11 @@ def _read_descriptor(descriptor: int) -> bytes:
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
+
+
+def _file_read_flags() -> int:
+    """Open file content as raw bytes on Windows without changing directory flags."""
+    return os.O_RDONLY | getattr(os, "O_BINARY", 0)
 
 
 def _fsync_parent_directory(path: Path) -> None:
