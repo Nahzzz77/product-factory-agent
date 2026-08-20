@@ -1,0 +1,77 @@
+{
+  "$defs": {
+    "GateType": {
+      "enum": [
+        "technical_adaptation",
+        "stage_acceptance"
+      ],
+      "title": "GateType",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "actor": {
+      "title": "Actor",
+      "type": "string"
+    },
+    "approval_id": {
+      "title": "Approval Id",
+      "type": "string"
+    },
+    "consumed_by_revision": {
+      "title": "Consumed By Revision",
+      "type": "integer"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "gate_type": {
+      "$ref": "#/$defs/GateType"
+    },
+    "request_id": {
+      "title": "Request Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "scope": {
+      "additionalProperties": true,
+      "title": "Scope",
+      "type": "object"
+    },
+    "source": {
+      "const": "interactive_cli",
+      "title": "Source",
+      "type": "string"
+    },
+    "state_revision": {
+      "title": "State Revision",
+      "type": "integer"
+    },
+    "statement": {
+      "title": "Statement",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "approval_id",
+    "request_id",
+    "gate_type",
+    "scope",
+    "state_revision",
+    "statement",
+    "actor",
+    "source",
+    "created_at",
+    "consumed_by_revision"
+  ],
+  "title": "ApprovalRecord",
+  "type": "object"
+}

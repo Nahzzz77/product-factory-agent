@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "RequirementDeclaration": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "source": {
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/RequirementStatus"
+        }
+      },
+      "required": [
+        "status",
+        "source"
+      ],
+      "title": "RequirementDeclaration",
+      "type": "object"
+    },
+    "RequirementStatus": {
+      "enum": [
+        "present",
+        "missing",
+        "not_applicable"
+      ],
+      "title": "RequirementStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "confirmed_at": {
+      "format": "date-time",
+      "title": "Confirmed At",
+      "type": "string"
+    },
+    "confirmed_by": {
+      "minLength": 1,
+      "title": "Confirmed By",
+      "type": "string"
+    },
+    "prd_confirmed": {
+      "title": "Prd Confirmed",
+      "type": "boolean"
+    },
+    "project_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{2,63}$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "requirements": {
+      "additionalProperties": {
+        "$ref": "#/$defs/RequirementDeclaration"
+      },
+      "title": "Requirements",
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "project_id",
+    "prd_confirmed",
+    "confirmed_by",
+    "confirmed_at",
+    "requirements"
+  ],
+  "title": "IntakeRecord",
+  "type": "object"
+}

@@ -17,6 +17,7 @@ dev = ["pytest>=8.3,<9"]
 
 [project.scripts]
 product-factory = "product_factory.cli.main:main"
+product-factory-export-schemas = "product_factory.contracts.export:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/product_factory"]

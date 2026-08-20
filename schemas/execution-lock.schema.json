@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "LockOwner": {
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "title": "Host",
+          "type": "string"
+        },
+        "pid": {
+          "title": "Pid",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "tool": {
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "session_id",
+        "pid",
+        "host"
+      ],
+      "title": "LockOwner",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "acquired_at": {
+      "format": "date-time",
+      "title": "Acquired At",
+      "type": "string"
+    },
+    "heartbeat_at": {
+      "format": "date-time",
+      "title": "Heartbeat At",
+      "type": "string"
+    },
+    "lease_expires_at": {
+      "format": "date-time",
+      "title": "Lease Expires At",
+      "type": "string"
+    },
+    "lock_id": {
+      "title": "Lock Id",
+      "type": "string"
+    },
+    "owner": {
+      "$ref": "#/$defs/LockOwner"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "state_revision": {
+      "title": "State Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "lock_id",
+    "owner",
+    "acquired_at",
+    "heartbeat_at",
+    "lease_expires_at",
+    "state_revision"
+  ],
+  "title": "LockRecord",
+  "type": "object"
+}

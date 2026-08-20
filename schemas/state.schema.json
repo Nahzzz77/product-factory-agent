@@ -1,0 +1,167 @@
+{
+  "$defs": {
+    "CompletionLevel": {
+      "enum": [
+        "none",
+        "implemented",
+        "system_verified",
+        "human_accepted"
+      ],
+      "title": "CompletionLevel",
+      "type": "string"
+    },
+    "CurrentStage": {
+      "additionalProperties": false,
+      "properties": {
+        "completion_level": {
+          "$ref": "#/$defs/CompletionLevel"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "sequence": {
+          "minimum": 1,
+          "title": "Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "sequence",
+        "completion_level"
+      ],
+      "title": "CurrentStage",
+      "type": "object"
+    },
+    "GateType": {
+      "enum": [
+        "technical_adaptation",
+        "stage_acceptance"
+      ],
+      "title": "GateType",
+      "type": "string"
+    },
+    "WaitingOn": {
+      "additionalProperties": false,
+      "properties": {
+        "gate_type": {
+          "$ref": "#/$defs/GateType"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "scope": {
+          "additionalProperties": true,
+          "title": "Scope",
+          "type": "object"
+        },
+        "type": {
+          "const": "approval",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "request_id",
+        "gate_type",
+        "scope"
+      ],
+      "title": "WaitingOn",
+      "type": "object"
+    },
+    "WorkflowState": {
+      "enum": [
+        "initialized",
+        "inputs_checked",
+        "adaptation_pending_approval",
+        "stage_development",
+        "system_verification",
+        "human_acceptance_pending",
+        "next_stage_or_frontend",
+        "release_ready",
+        "deployment_pending_approval",
+        "deployed_pending_acceptance",
+        "production_accepted",
+        "observing"
+      ],
+      "title": "WorkflowState",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "current_stage": {
+      "$ref": "#/$defs/CurrentStage"
+    },
+    "last_event_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Event Id"
+    },
+    "last_valid_evidence_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Last Valid Evidence Id"
+    },
+    "project_id": {
+      "title": "Project Id",
+      "type": "string"
+    },
+    "revision": {
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "waiting_on": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WaitingOn"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "workflow_state": {
+      "$ref": "#/$defs/WorkflowState"
+    }
+  },
+  "required": [
+    "schema_version",
+    "project_id",
+    "revision",
+    "workflow_state",
+    "current_stage",
+    "updated_at"
+  ],
+  "title": "StateRecord",
+  "type": "object"
+}
