@@ -59,6 +59,30 @@ class _TakeoverGuard:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _LockTransition:
+    """An immutable, fencing-ordered change to the authoritative lock state."""
+
+    generation: int
+    guard_id: str
+    state: str
+    record: LockRecord | None
+    prior_lock_id: str | None
+    prior_lease_expires_at: datetime | None
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "guard_id": self.guard_id,
+            "state": self.state,
+            "record": None if self.record is None else self.record.model_dump(mode="json"),
+            "prior_lock_id": self.prior_lock_id,
+            "prior_lease_expires_at": (
+                None if self.prior_lease_expires_at is None else self.prior_lease_expires_at.isoformat()
+            ),
+        }
+
+
 class LockManager:
     """Own the durable lease file for one project root."""
 
@@ -66,58 +90,25 @@ class LockManager:
         self.paths = ProjectPaths(root.resolve())
         self.path = self.paths.lock
         self.takeover_guard_dir = self.path.with_name("execution-lock.takeover-guards")
+        self.lock_transition_dir = self.path.with_name("execution-lock-transitions")
         self.now = now_fn or (lambda: datetime.now(timezone.utc))
 
     def acquire(self, owner: LockOwner, state_revision: int, lease: timedelta) -> LockRecord:
         self._require_positive_lease(lease)
-        with self._guard(owner):
+        with self._guard(owner) as guard:
             existing = self.status()
             if existing is not None:
-                raise FactoryError(
-                    "lock_held",
-                    ErrorCategory.ENVIRONMENT_BLOCKED,
-                    "执行锁已被占用",
-                    "lock acquire",
-                    True,
-                    "运行 lock status，或在租约过期后显式接管",
-                )
+                raise self._lock_held()
             record = self._new_record(owner, state_revision, lease)
-            if not self._exclusive_create_record(self.path, record):
-                raise FactoryError(
-                    "lock_held",
-                    ErrorCategory.ENVIRONMENT_BLOCKED,
-                    "执行锁已被占用",
-                    "lock acquire",
-                    True,
-                    "运行 lock status，或在租约过期后显式接管",
-                )
+            self._commit_transition(guard, "present", record, None, self._lock_held)
             return record
 
     def status(self) -> LockRecord | None:
-        try:
-            content = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        transition = self._latest_transition()
+        if transition is None:
             return None
-        except OSError as exc:
-            raise FactoryError(
-                "lock_unreadable",
-                ErrorCategory.ENVIRONMENT_BLOCKED,
-                "无法读取执行锁",
-                "lock status",
-                True,
-                "检查项目目录权限",
-            ) from exc
-        try:
-            return LockRecord.model_validate_json(content)
-        except (ValidationError, ValueError) as exc:
-            raise FactoryError(
-                "lock_invalid",
-                ErrorCategory.ENVIRONMENT_BLOCKED,
-                "执行锁文件无效",
-                "lock status",
-                True,
-                "释放或显式接管执行锁",
-            ) from exc
+        self._synchronize_projection(transition)
+        return transition.record
 
     def require(self, lock_id: str, expected_revision: int) -> LockRecord:
         record = self.status()
@@ -152,7 +143,7 @@ class LockManager:
 
     def heartbeat(self, lock_id: str, lease: timedelta) -> LockRecord:
         self._require_positive_lease(lease)
-        with self._guard(self._guard_owner(lock_id)):
+        with self._guard(self._guard_owner(lock_id)) as guard:
             record = self._matching_record(lock_id, "lock heartbeat")
             if record.lease_expires_at <= self._now():
                 raise FactoryError(
@@ -167,17 +158,25 @@ class LockManager:
             refreshed = record.model_copy(
                 update={"heartbeat_at": now, "lease_expires_at": now + lease}
             )
-            atomic_write_json(self.path, refreshed.model_dump(mode="json"))
+            self._commit_transition(
+                guard,
+                "present",
+                refreshed,
+                record,
+                lambda: self._owner_mismatch("lock heartbeat"),
+            )
             return refreshed
 
     def release(self, lock_id: str) -> None:
-        with self._guard(self._guard_owner(lock_id)):
-            self._matching_record(lock_id, "lock release")
-            try:
-                self.path.unlink()
-                _fsync_parent_directory(self.path)
-            except FileNotFoundError as exc:
-                raise self._owner_mismatch("lock release") from exc
+        with self._guard(self._guard_owner(lock_id)) as guard:
+            record = self._matching_record(lock_id, "lock release")
+            self._commit_transition(
+                guard,
+                "released",
+                None,
+                record,
+                lambda: self._owner_mismatch("lock release"),
+            )
 
     def takeover(
         self,
@@ -197,7 +196,7 @@ class LockManager:
                 False,
                 "提供接管原因",
             )
-        with self._guard(owner):
+        with self._guard(owner) as guard:
             old = self.status()
             if old is None or old.lock_id != old_lock_id:
                 raise FactoryError(
@@ -218,9 +217,9 @@ class LockManager:
                     "等待租约过期或让原持有者释放",
                 )
 
-            # This is deliberately inside the exclusive takeover guard. A contender
-            # must prove the same expired record is still present immediately before
-            # unlinking it, so it cannot delete another contender's new lease.
+            # Revalidate while holding the guard before creating its fenced
+            # transition.  The transition journal, not the projection pathname,
+            # remains authoritative if this guard expires during the operation.
             current = self.status()
             if current is None or current.lock_id != old_lock_id:
                 raise FactoryError(
@@ -249,18 +248,14 @@ class LockManager:
                     True,
                     "等待租约过期或让原持有者释放",
                 )
-            self.path.unlink()
-            _fsync_parent_directory(self.path)
             replacement = self._new_record(owner, state_revision, lease)
-            if not self._exclusive_create_record(self.path, replacement):
-                raise FactoryError(
-                    "lock_held",
-                    ErrorCategory.ENVIRONMENT_BLOCKED,
-                    "执行锁在接管期间被重新获取",
-                    "lock takeover",
-                    True,
-                    "运行 lock status 后重试",
-                )
+            self._commit_transition(
+                guard,
+                "present",
+                replacement,
+                old,
+                self._takeover_changed,
+            )
             return TakeoverResult(
                 lock=replacement,
                 details={
@@ -298,11 +293,31 @@ class LockManager:
             "使用当前锁 ID，或等待租约过期后显式接管",
         )
 
+    def _lock_held(self) -> FactoryError:
+        return FactoryError(
+            "lock_held",
+            ErrorCategory.ENVIRONMENT_BLOCKED,
+            "执行锁已被占用",
+            "lock acquire",
+            True,
+            "运行 lock status，或在租约过期后显式接管",
+        )
+
+    def _takeover_changed(self) -> FactoryError:
+        return FactoryError(
+            "lock_changed",
+            ErrorCategory.ENVIRONMENT_BLOCKED,
+            "指定执行锁已改变",
+            "lock takeover",
+            True,
+            "运行 lock status 后重试",
+        )
+
     @contextmanager
-    def _guard(self, owner: LockOwner) -> Iterator[None]:
+    def _guard(self, owner: LockOwner) -> Iterator[_TakeoverGuard]:
         guard = self._acquire_guard(owner)
         try:
-            yield
+            yield guard
         finally:
             self._release_guard(guard)
 
@@ -390,6 +405,139 @@ class LockManager:
             return None
         return latest
 
+    def _commit_transition(
+        self,
+        guard: _TakeoverGuard,
+        state: str,
+        record: LockRecord | None,
+        prior: LockRecord | None,
+        conflict: Callable[[], FactoryError],
+    ) -> _LockTransition:
+        """Commit one mutation at this guard's immutable fencing generation."""
+        if self._now() >= guard.expires_at:
+            raise conflict()
+        latest = self._latest_transition()
+        if latest is not None and latest.generation >= guard.generation:
+            raise conflict()
+        transition = _LockTransition(
+            generation=guard.generation,
+            guard_id=guard.guard_id,
+            state=state,
+            record=record,
+            prior_lock_id=None if prior is None else prior.lock_id,
+            prior_lease_expires_at=None if prior is None else prior.lease_expires_at,
+        )
+        if not self._publish_transition_exclusive(transition):
+            raise conflict()
+        latest = self._latest_transition()
+        if latest is None or latest.generation != guard.generation:
+            raise conflict()
+        self._synchronize_projection(latest)
+        return transition
+
+    def _transition_path(self, generation: int) -> Path:
+        return self.lock_transition_dir / f"{generation:020d}.json"
+
+    def _publish_transition_exclusive(self, transition: _LockTransition) -> bool:
+        return self._exclusive_create_payload(
+            self._transition_path(transition.generation), transition.payload()
+        )
+
+    def _latest_transition(self) -> _LockTransition | None:
+        if not self.lock_transition_dir.exists():
+            return None
+        candidates = [
+            path
+            for path in self.lock_transition_dir.glob("*.json")
+            if path.stem.isdigit()
+        ]
+        if not candidates:
+            return None
+        latest_path = max(candidates, key=lambda path: int(path.stem))
+        return self._read_transition_path(latest_path)
+
+    def _read_transition_path(self, path: Path) -> _LockTransition | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            transition = self._parse_transition(payload)
+            if transition.generation != int(path.stem):
+                raise ValueError("transition generation does not match its path")
+            return transition
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise FactoryError(
+                "lock_unreadable",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "无法读取执行锁",
+                "lock status",
+                True,
+                "检查项目目录权限",
+            ) from exc
+        except (json.JSONDecodeError, KeyError, TypeError, ValidationError, ValueError) as exc:
+            raise FactoryError(
+                "lock_invalid",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "执行锁转换记录无效",
+                "lock status",
+                True,
+                "检查并移除无效的执行锁转换记录",
+            ) from exc
+
+    def _parse_transition(self, payload: Any) -> _LockTransition:
+        if not isinstance(payload, dict):
+            raise ValueError("transition must be a JSON object")
+        generation = payload["generation"]
+        guard_id = payload["guard_id"]
+        state = payload["state"]
+        prior_lock_id = payload["prior_lock_id"]
+        prior_lease_expires_at = payload["prior_lease_expires_at"]
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise ValueError("transition generation must be a non-negative integer")
+        if not isinstance(guard_id, str) or not guard_id:
+            raise ValueError("transition guard_id must be a non-empty string")
+        if state not in {"present", "released"}:
+            raise ValueError("transition state is invalid")
+        if (prior_lock_id is None) != (prior_lease_expires_at is None):
+            raise ValueError("transition prior identity and expiry must occur together")
+        if prior_lock_id is not None and not isinstance(prior_lock_id, str):
+            raise ValueError("transition prior lock ID must be a string")
+        if prior_lease_expires_at is None:
+            prior_expiry = None
+        else:
+            prior_expiry = datetime.fromisoformat(prior_lease_expires_at)
+            if prior_expiry.tzinfo is None:
+                raise ValueError("transition prior expiry must be timezone-aware")
+        if state == "present":
+            record = LockRecord.model_validate(payload["record"])
+        else:
+            if payload["record"] is not None:
+                raise ValueError("released transition cannot contain a lock record")
+            record = None
+        return _LockTransition(
+            generation=generation,
+            guard_id=guard_id,
+            state=state,
+            record=record,
+            prior_lock_id=prior_lock_id,
+            prior_lease_expires_at=prior_expiry,
+        )
+
+    def _synchronize_projection(self, transition: _LockTransition) -> None:
+        """Best-effort, non-authoritative compatibility view of the journal state."""
+        try:
+            if transition.record is None:
+                # The tombstone is already authoritative; this only removes the
+                # compatibility projection and can never change status semantics.
+                self.path.unlink(missing_ok=True)
+                _fsync_parent_directory(self.path)
+            else:
+                atomic_write_json(self.path, transition.record.model_dump(mode="json"))
+        except OSError:
+            # The transition is durable and authoritative.  A later status call
+            # retries projection calibration without changing lock semantics.
+            return
+
     def _takeover_in_progress(self) -> FactoryError:
         return FactoryError(
             "takeover_in_progress",
@@ -399,9 +547,6 @@ class LockManager:
             True,
             "稍后重试",
         )
-
-    def _exclusive_create_record(self, path: Path, record: LockRecord) -> bool:
-        return self._exclusive_create_payload(path, record.model_dump(mode="json"))
 
     def _exclusive_create_payload(self, path: Path, payload: dict[str, Any]) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -303,3 +303,127 @@ def test_expired_recoverer_cannot_replace_successor_generation(
     assert len(errors) == 1
     assert errors[0].code == "takeover_in_progress"
     assert manager._current_guard() == successor
+
+
+def test_expired_takeover_cannot_commit_below_successor_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old_lock = manager.acquire(owner("old"), 0, timedelta(seconds=1))
+    current[0] += timedelta(seconds=2)
+    old_commit_started = Event()
+    allow_old_commit = Event()
+    original_commit = manager._commit_transition
+    results = []
+    errors = []
+
+    def pause_old_commit(*args, **kwargs):
+        guard = args[0]
+        if guard.generation == 1 and current_thread().name == "old-takeover":
+            old_commit_started.set()
+            assert allow_old_commit.wait(timeout=5)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_commit_transition", pause_old_commit)
+
+    def old_takeover() -> None:
+        try:
+            results.append(
+                manager.takeover(
+                    old_lock.lock_id,
+                    owner("old-takeover"),
+                    1,
+                    "original owner ended",
+                    timedelta(minutes=5),
+                )
+            )
+        except FactoryError as error:
+            errors.append(error)
+
+    old = Thread(target=old_takeover, name="old-takeover")
+    old.start()
+    assert old_commit_started.wait(timeout=5)
+
+    current[0] += timedelta(seconds=31)
+    successor = manager.takeover(
+        old_lock.lock_id,
+        owner("successor"),
+        2,
+        "fence expired predecessor",
+        timedelta(minutes=5),
+    )
+    assert manager.status() == successor.lock
+    allow_old_commit.set()
+    old.join(timeout=5)
+
+    assert not old.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert errors[0].code == "lock_changed"
+    assert manager.status() == successor.lock
+
+
+@pytest.mark.parametrize("operation", ["heartbeat", "release"])
+def test_late_low_generation_mutation_cannot_override_successor_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old_lock = manager.acquire(owner("old"), 0, timedelta(seconds=10))
+    old_commit_started = Event()
+    allow_old_commit = Event()
+    original_commit = manager._commit_transition
+    errors = []
+
+    def pause_old_commit(*args, **kwargs):
+        guard = args[0]
+        if guard.generation == 1 and current_thread().name == f"old-{operation}":
+            old_commit_started.set()
+            assert allow_old_commit.wait(timeout=5)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_commit_transition", pause_old_commit)
+
+    def delayed_mutation() -> None:
+        try:
+            if operation == "heartbeat":
+                manager.heartbeat(old_lock.lock_id, timedelta(minutes=5))
+            else:
+                manager.release(old_lock.lock_id)
+        except FactoryError as error:
+            errors.append(error)
+
+    delayed = Thread(target=delayed_mutation, name=f"old-{operation}")
+    delayed.start()
+    assert old_commit_started.wait(timeout=5)
+
+    current[0] += timedelta(seconds=31)
+    successor = manager.takeover(
+        old_lock.lock_id,
+        owner("successor"),
+        2,
+        "fence expired predecessor",
+        timedelta(minutes=5),
+    )
+    assert manager.status() == successor.lock
+    allow_old_commit.set()
+    delayed.join(timeout=5)
+
+    assert not delayed.is_alive()
+    assert len(errors) == 1
+    assert errors[0].code == "lock_owner_mismatch"
+    assert manager.status() == successor.lock
+
+
+def test_status_uses_highest_transition_even_if_projection_is_stale(tmp_path: Path) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    original = manager.acquire(owner("old"), 0, timedelta(seconds=10))
+    current[0] += timedelta(seconds=1)
+    refreshed = manager.heartbeat(original.lock_id, timedelta(minutes=5))
+
+    atomic_write_json(manager.path, original.model_dump(mode="json"))
+
+    assert manager.status() == refreshed
+    assert manager.require(refreshed.lock_id, 0) == refreshed
