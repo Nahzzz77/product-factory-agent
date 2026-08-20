@@ -26,6 +26,8 @@ def _fsync_parent_directory(path: Path) -> None:
         directory_fd = os.open(path.parent, os.O_RDONLY)
         os.fsync(directory_fd)
     except OSError as exc:
+        if directory_fd is None and os.name == "nt" and exc.errno in {errno.EACCES, errno.EPERM}:
+            return
         if exc.errno not in _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
             raise
     finally:

@@ -53,3 +53,32 @@ def test_parent_directory_fsync_propagates_write_error(
         files._fsync_parent_directory(tmp_path / "state.json")
 
     assert caught.value.errno == errno.EIO
+
+
+def test_parent_directory_fsync_tolerates_windows_directory_open_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(files.os, "name", "nt")
+    monkeypatch.setattr(
+        files.os,
+        "open",
+        lambda path, flags: (_ for _ in ()).throw(PermissionError(errno.EACCES, "denied")),
+    )
+
+    files._fsync_parent_directory(tmp_path / "state.json")
+
+
+def test_parent_directory_fsync_keeps_non_windows_permission_error_strict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(files.os, "name", "posix")
+    monkeypatch.setattr(
+        files.os,
+        "open",
+        lambda path, flags: (_ for _ in ()).throw(PermissionError(errno.EACCES, "denied")),
+    )
+
+    with pytest.raises(PermissionError) as caught:
+        files._fsync_parent_directory(tmp_path / "state.json")
+
+    assert caught.value.errno == errno.EACCES

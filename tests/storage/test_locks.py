@@ -1,11 +1,14 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event, Thread, current_thread
 
 import pytest
 
 from product_factory.contracts.models import LockOwner
 from product_factory.errors import FactoryError
+from product_factory.storage import locks
+from product_factory.storage.files import atomic_write_json
 from product_factory.storage.locks import LockManager
 
 
@@ -174,3 +177,85 @@ def test_expired_takeover_guard_is_recovered_before_takeover(tmp_path: Path) -> 
 
     assert manager.status() == result.lock
     assert not manager.takeover_guard_path.exists()
+
+
+def test_simultaneous_stale_guard_recovery_has_only_one_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    first = LockManager(tmp_path, now_fn=lambda: now)
+    second = LockManager(tmp_path, now_fn=lambda: now)
+    first.paths.metadata.mkdir(parents=True)
+    first.takeover_guard_path.write_text(
+        '{"guard_id":"stale","owner":{"tool":"codex","session_id":"z","pid":1,"host":"mac"},'
+        '"acquired_at":"2026-08-19T00:00:00+00:00","expires_at":"2026-08-19T00:00:01+00:00"}\n',
+        encoding="utf-8",
+    )
+    second_is_ready_to_unlink = Event()
+    allow_second_to_unlink = Event()
+    original_unlink = Path.unlink
+    results = []
+    errors = []
+
+    def delay_second_unlink(path: Path, *args, **kwargs) -> None:
+        if path == second.takeover_guard_path and current_thread().name == "recover-second":
+            second_is_ready_to_unlink.set()
+            assert allow_second_to_unlink.wait(timeout=5)
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(locks.Path, "unlink", delay_second_unlink)
+
+    def recover(manager: LockManager, session_id: str) -> None:
+        try:
+            results.append(manager._acquire_guard(owner(session_id)))
+        except FactoryError as error:
+            errors.append(error)
+
+    delayed = Thread(target=recover, args=(second, "second"), name="recover-second")
+    delayed.start()
+    assert second_is_ready_to_unlink.wait(timeout=5)
+
+    winner = Thread(target=recover, args=(first, "first"), name="recover-first")
+    winner.start()
+    winner.join(timeout=5)
+    allow_second_to_unlink.set()
+    delayed.join(timeout=5)
+
+    assert not winner.is_alive()
+    assert not delayed.is_alive()
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert errors[0].code == "takeover_in_progress"
+    assert first._read_guard() == results[0]
+
+
+def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old = manager.acquire(owner("a"), 0, timedelta(seconds=1))
+    current[0] += timedelta(seconds=2)
+    original_status = manager.status
+    reads = 0
+
+    def status_with_changed_expiry():
+        nonlocal reads
+        reads += 1
+        record = original_status()
+        if reads == 2:
+            assert record is not None
+            changed = record.model_copy(
+                update={"lease_expires_at": record.lease_expires_at - timedelta(microseconds=1)}
+            )
+            atomic_write_json(manager.path, changed.model_dump(mode="json"))
+            return changed
+        return record
+
+    monkeypatch.setattr(manager, "status", status_with_changed_expiry)
+
+    with pytest.raises(FactoryError) as caught:
+        manager.takeover(old.lock_id, owner("b"), 0, "previous session ended", timedelta(minutes=5))
+
+    assert caught.value.code == "lock_changed"
+    assert original_status().lock_id == old.lock_id

@@ -57,6 +57,24 @@ class _TakeoverGuard:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _TakeoverRecovery:
+    recovery_id: str
+    owner: LockOwner
+    acquired_at: datetime
+    expires_at: datetime
+    guard: _TakeoverGuard
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "recovery_id": self.recovery_id,
+            "owner": self.owner.model_dump(mode="json"),
+            "acquired_at": self.acquired_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "guard": self.guard.payload(),
+        }
+
+
 class LockManager:
     """Own the durable lease file for one project root."""
 
@@ -64,6 +82,7 @@ class LockManager:
         self.paths = ProjectPaths(root.resolve())
         self.path = self.paths.lock
         self.takeover_guard_path = self.path.with_name("execution-lock.takeover-guard.json")
+        self.takeover_recovery_path = self.path.with_name("execution-lock.takeover-recovery.json")
         self.now = now_fn or (lambda: datetime.now(timezone.utc))
 
     def acquire(self, owner: LockOwner, state_revision: int, lease: timedelta) -> LockRecord:
@@ -229,6 +248,15 @@ class LockManager:
                     True,
                     "运行 lock status 后重试",
                 )
+            if current.lease_expires_at != old.lease_expires_at:
+                raise FactoryError(
+                    "lock_changed",
+                    ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "指定执行锁的租约已改变",
+                    "lock takeover",
+                    True,
+                    "运行 lock status 后重试",
+                )
             if current.lease_expires_at > self._now():
                 raise FactoryError(
                     "lock_active",
@@ -299,6 +327,12 @@ class LockManager:
         self.takeover_guard_path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             now = self._now()
+            recovery = self._read_recovery()
+            if recovery is not None:
+                if recovery.expires_at > now:
+                    raise self._takeover_in_progress()
+                self._recover_abandoned_recovery(recovery)
+                continue
             guard = _TakeoverGuard(uuid.uuid4().hex, owner, now, now + _GUARD_LEASE)
             if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
                 return guard
@@ -307,29 +341,33 @@ class LockManager:
             if existing is None:
                 continue
             if existing.expires_at > now:
-                raise FactoryError(
-                    "takeover_in_progress",
-                    ErrorCategory.ENVIRONMENT_BLOCKED,
-                    "另一个会话正在变更执行锁",
-                    "lock takeover",
-                    True,
-                    "稍后重试",
-                )
+                raise self._takeover_in_progress()
 
-            # Recover only a guard that is still exactly the expired record we
-            # inspected. Active guards are never removed by another session.
-            confirmed = self._read_guard()
-            if confirmed is None:
-                continue
-            if confirmed.guard_id != existing.guard_id or confirmed.expires_at != existing.expires_at:
-                continue
-            if confirmed.expires_at > self._now():
-                continue
+            recovery = _TakeoverRecovery(
+                recovery_id=uuid.uuid4().hex,
+                owner=owner,
+                acquired_at=now,
+                expires_at=now + _GUARD_LEASE,
+                guard=existing,
+            )
+            if not self._exclusive_create_payload(self.takeover_recovery_path, recovery.payload()):
+                raise self._takeover_in_progress()
             try:
+                confirmed = self._read_guard()
+                if confirmed is None:
+                    continue
+                if (
+                    confirmed.guard_id != existing.guard_id
+                    or confirmed.expires_at != existing.expires_at
+                    or confirmed.expires_at > self._now()
+                ):
+                    continue
                 self.takeover_guard_path.unlink()
                 _fsync_parent_directory(self.takeover_guard_path)
-            except FileNotFoundError:
-                continue
+                if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
+                    return guard
+            finally:
+                self._release_recovery(recovery)
 
     def _release_guard(self, guard: _TakeoverGuard) -> None:
         # Once its own lease has elapsed, this caller may no longer remove the
@@ -348,21 +386,7 @@ class LockManager:
     def _read_guard(self) -> _TakeoverGuard | None:
         try:
             payload = json.loads(self.takeover_guard_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("guard must be a JSON object")
-            guard_id = payload["guard_id"]
-            if not isinstance(guard_id, str) or not guard_id:
-                raise ValueError("guard_id must be a non-empty string")
-            acquired_at = datetime.fromisoformat(payload["acquired_at"])
-            expires_at = datetime.fromisoformat(payload["expires_at"])
-            if acquired_at.tzinfo is None or expires_at.tzinfo is None:
-                raise ValueError("guard timestamps must be timezone-aware")
-            return _TakeoverGuard(
-                guard_id=guard_id,
-                owner=LockOwner.model_validate(payload["owner"]),
-                acquired_at=acquired_at,
-                expires_at=expires_at,
-            )
+            return self._parse_guard(payload)
         except FileNotFoundError:
             return None
         except (json.JSONDecodeError, KeyError, TypeError, ValidationError, ValueError) as exc:
@@ -374,6 +398,83 @@ class LockManager:
                 True,
                 "检查并移除损坏的接管保护文件",
             ) from exc
+
+    def _read_recovery(self) -> _TakeoverRecovery | None:
+        try:
+            payload = json.loads(self.takeover_recovery_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("recovery must be a JSON object")
+            recovery_id = payload["recovery_id"]
+            if not isinstance(recovery_id, str) or not recovery_id:
+                raise ValueError("recovery_id must be a non-empty string")
+            acquired_at = datetime.fromisoformat(payload["acquired_at"])
+            expires_at = datetime.fromisoformat(payload["expires_at"])
+            if acquired_at.tzinfo is None or expires_at.tzinfo is None:
+                raise ValueError("recovery timestamps must be timezone-aware")
+            return _TakeoverRecovery(
+                recovery_id=recovery_id,
+                owner=LockOwner.model_validate(payload["owner"]),
+                acquired_at=acquired_at,
+                expires_at=expires_at,
+                guard=self._parse_guard(payload["guard"]),
+            )
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, KeyError, TypeError, ValidationError, ValueError) as exc:
+            raise FactoryError(
+                "takeover_recovery_invalid",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "接管恢复声明无效，已保留以避免误删",
+                "lock takeover",
+                True,
+                "检查并移除损坏的接管恢复声明",
+            ) from exc
+
+    def _parse_guard(self, payload: Any) -> _TakeoverGuard:
+        if not isinstance(payload, dict):
+            raise ValueError("guard must be a JSON object")
+        guard_id = payload["guard_id"]
+        if not isinstance(guard_id, str) or not guard_id:
+            raise ValueError("guard_id must be a non-empty string")
+        acquired_at = datetime.fromisoformat(payload["acquired_at"])
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+        if acquired_at.tzinfo is None or expires_at.tzinfo is None:
+            raise ValueError("guard timestamps must be timezone-aware")
+        return _TakeoverGuard(
+            guard_id=guard_id,
+            owner=LockOwner.model_validate(payload["owner"]),
+            acquired_at=acquired_at,
+            expires_at=expires_at,
+        )
+
+    def _recover_abandoned_recovery(self, recovery: _TakeoverRecovery) -> None:
+        """Restore the exact stale guard after a crashed recovery owner."""
+        current = self._read_guard()
+        if current is None:
+            self._exclusive_create_payload(self.takeover_guard_path, recovery.guard.payload())
+        self._release_recovery(recovery, allow_expired=True)
+
+    def _release_recovery(self, recovery: _TakeoverRecovery, *, allow_expired: bool = False) -> None:
+        if not allow_expired and self._now() >= recovery.expires_at:
+            return
+        current = self._read_recovery()
+        if current is None or current.recovery_id != recovery.recovery_id:
+            return
+        try:
+            self.takeover_recovery_path.unlink()
+            _fsync_parent_directory(self.takeover_recovery_path)
+        except FileNotFoundError:
+            return
+
+    def _takeover_in_progress(self) -> FactoryError:
+        return FactoryError(
+            "takeover_in_progress",
+            ErrorCategory.ENVIRONMENT_BLOCKED,
+            "另一个会话正在变更执行锁",
+            "lock takeover",
+            True,
+            "稍后重试",
+        )
 
     def _exclusive_create_record(self, path: Path, record: LockRecord) -> bool:
         return self._exclusive_create_payload(path, record.model_dump(mode="json"))
