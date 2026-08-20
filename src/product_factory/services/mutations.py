@@ -14,9 +14,11 @@ def commit_state_change(
     next_state: StateRecord,
     event_type: str,
     details: dict[str, Any],
+    *,
+    event_id: str | None = None,
 ) -> StateRecord:
     """Commit state before its audit event, retaining repairable event identity on failure."""
-    event_id = str(uuid4())
+    event_id = event_id or str(uuid4())
     committed = next_state.model_copy(update={"last_event_id": event_id})
     repo.save_state(committed, expected_revision=current.revision)
     repo.append_event(
