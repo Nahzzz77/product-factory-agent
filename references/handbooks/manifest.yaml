@@ -1,0 +1,16 @@
+schema_version: "1.0"
+recorded_at: "2026-08-20"
+documents:
+  - title: "AI Agent 产品 Vibe Coding 通用技术栈手册"
+    version: "V2.1"
+    path: "references/handbooks/AI产品Vibe Coding通用技术栈手册.md"
+    sha256: "a3439fc0159f8ac0446d81fe37ce7fcbf6eb4e233c12a246a720bf8c342809b5"
+  - title: "AI Agent 产品 Vibe Coding 通用前端技术栈手册"
+    version: "V1.0"
+    path: "references/handbooks/AI产品Vibe Coding通用前端技术栈手册.md"
+    sha256: "33a7fd0f32642f2333672e4d3669202784c380e0bb3218bff847201b033a252b"
+  - title: "AI Agent 产品上线部署手册"
+    version: "V1.1"
+    path: "references/handbooks/AI Agent 产品上线部署手册(1).md"
+    sha256: "5db65f78d5b96b472c8e194afef00007eca0bf183c551cf1e0e03e55f1eed156"
+
