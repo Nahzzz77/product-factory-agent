@@ -121,3 +121,20 @@ def test_nonblocking_issues_and_successful_mock_do_not_replace_real_model() -> N
     assert evaluate_evidence(manifest, _project(), _state(), "b" * 64) == [
         "real_model_missing",
     ]
+
+
+def test_unknown_current_stage_returns_stable_mismatch_without_crashing() -> None:
+    """Independently valid records cannot leak StopIteration when state is stale."""
+    stale_state = _state().model_copy(
+        update={
+            "current_stage": CurrentStage(
+                id="removed-stage",
+                sequence=2,
+                completion_level=CompletionLevel.SYSTEM_VERIFIED,
+            )
+        }
+    )
+
+    assert evaluate_evidence(_manifest(stage_id="removed-stage"), _project(), stale_state, "b" * 64) == [
+        "stage_mismatch",
+    ]

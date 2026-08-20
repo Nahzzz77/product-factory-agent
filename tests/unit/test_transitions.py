@@ -71,3 +71,136 @@ def test_matching_adaptation_approval_allows_development() -> None:
 
     assert rule.requires_approval is True
     assert rule.requires_evidence is False
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (WorkflowState.INITIALIZED, WorkflowState.RELEASE_READY),
+        (WorkflowState.NEXT_STAGE_OR_FRONTEND, WorkflowState.INPUTS_CHECKED),
+        (WorkflowState.RELEASE_READY, WorkflowState.DEPLOYMENT_PENDING_APPROVAL),
+        (WorkflowState.DEPLOYMENT_PENDING_APPROVAL, WorkflowState.DEPLOYED_PENDING_ACCEPTANCE),
+        (WorkflowState.DEPLOYED_PENDING_ACCEPTANCE, WorkflowState.PRODUCTION_ACCEPTED),
+        (WorkflowState.PRODUCTION_ACCEPTED, WorkflowState.OBSERVING),
+        (WorkflowState.OBSERVING, WorkflowState.OBSERVING),
+    ],
+)
+def test_post_milestone_one_protocol_states_are_unsupported(
+    current: WorkflowState, target: WorkflowState
+) -> None:
+    """Routing toward any unimplemented protocol phase must not look invalid."""
+    with pytest.raises(FactoryError) as caught:
+        require_transition(
+            current,
+            target,
+            CompletionLevel.HUMAN_ACCEPTED,
+            has_approval=True,
+            has_valid_evidence=True,
+        )
+
+    assert caught.value.code == "unsupported_transition"
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "completion", "has_approval", "has_valid_evidence"),
+    [
+        (WorkflowState.INITIALIZED, WorkflowState.INPUTS_CHECKED, CompletionLevel.NONE, False, False),
+        (
+            WorkflowState.INPUTS_CHECKED,
+            WorkflowState.ADAPTATION_PENDING_APPROVAL,
+            CompletionLevel.NONE,
+            False,
+            False,
+        ),
+        (
+            WorkflowState.ADAPTATION_PENDING_APPROVAL,
+            WorkflowState.STAGE_DEVELOPMENT,
+            CompletionLevel.NONE,
+            True,
+            False,
+        ),
+        (
+            WorkflowState.STAGE_DEVELOPMENT,
+            WorkflowState.SYSTEM_VERIFICATION,
+            CompletionLevel.NONE,
+            False,
+            False,
+        ),
+        (
+            WorkflowState.SYSTEM_VERIFICATION,
+            WorkflowState.HUMAN_ACCEPTANCE_PENDING,
+            CompletionLevel.SYSTEM_VERIFIED,
+            False,
+            True,
+        ),
+        (
+            WorkflowState.HUMAN_ACCEPTANCE_PENDING,
+            WorkflowState.NEXT_STAGE_OR_FRONTEND,
+            CompletionLevel.SYSTEM_VERIFIED,
+            True,
+            True,
+        ),
+    ],
+)
+def test_all_milestone_one_transitions_accept_exactly_their_gates(
+    current: WorkflowState,
+    target: WorkflowState,
+    completion: CompletionLevel,
+    has_approval: bool,
+    has_valid_evidence: bool,
+) -> None:
+    """Each promised milestone-one edge remains available with its exact inputs."""
+    assert require_transition(
+        current,
+        target,
+        completion,
+        has_approval=has_approval,
+        has_valid_evidence=has_valid_evidence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("completion", "has_approval", "has_valid_evidence", "code", "category"),
+    [
+        (
+            CompletionLevel.IMPLEMENTED,
+            False,
+            False,
+            "completion_mismatch",
+            "implementation_failed",
+        ),
+        (
+            CompletionLevel.SYSTEM_VERIFIED,
+            False,
+            False,
+            "approval_missing",
+            "approval_required",
+        ),
+        (
+            CompletionLevel.SYSTEM_VERIFIED,
+            True,
+            False,
+            "evidence_missing",
+            "implementation_failed",
+        ),
+    ],
+)
+def test_final_gate_reports_first_unsatisfied_requirement_in_rule_order(
+    completion: CompletionLevel,
+    has_approval: bool,
+    has_valid_evidence: bool,
+    code: str,
+    category: str,
+) -> None:
+    """Changing error precedence must not hide the next user action."""
+    with pytest.raises(FactoryError) as caught:
+        require_transition(
+            WorkflowState.HUMAN_ACCEPTANCE_PENDING,
+            WorkflowState.NEXT_STAGE_OR_FRONTEND,
+            completion,
+            has_approval=has_approval,
+            has_valid_evidence=has_valid_evidence,
+        )
+
+    assert caught.value.code == code
+    assert caught.value.category == category

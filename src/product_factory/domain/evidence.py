@@ -11,8 +11,10 @@ def evaluate_evidence(
 ) -> list[str]:
     """Return the stable list of reasons this evidence cannot be reused."""
     reasons: list[str] = []
-    stage = next(item for item in project.stage_plan if item.id == state.current_stage.id)
-    if manifest.stage_id != stage.id:
+    stage = next(
+        (item for item in project.stage_plan if item.id == state.current_stage.id), None
+    )
+    if stage is None or manifest.stage_id != stage.id:
         reasons.append("stage_mismatch")
     if manifest.state_revision > state.revision:
         reasons.append("future_revision")
@@ -24,7 +26,7 @@ def evaluate_evidence(
         reasons.append("source_changed")
     if any(check.exit_status != 0 for check in manifest.checks):
         reasons.append("check_failed")
-    if stage.requires_real_model and not any(
+    if stage is not None and stage.requires_real_model and not any(
         check.mode == "real" and check.exit_status == 0 for check in manifest.checks
     ):
         reasons.append("real_model_missing")

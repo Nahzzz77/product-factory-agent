@@ -44,6 +44,22 @@ RULES = {
 }
 
 
+POST_MILESTONE_ONE_STATES = frozenset(
+    {
+        WorkflowState.NEXT_STAGE_OR_FRONTEND,
+        WorkflowState.RELEASE_READY,
+        WorkflowState.DEPLOYMENT_PENDING_APPROVAL,
+        WorkflowState.DEPLOYED_PENDING_ACCEPTANCE,
+        WorkflowState.PRODUCTION_ACCEPTED,
+        WorkflowState.OBSERVING,
+    }
+)
+
+FUTURE_TARGET_STATES = POST_MILESTONE_ONE_STATES - {
+    WorkflowState.NEXT_STAGE_OR_FRONTEND
+}
+
+
 def require_transition(
     current: WorkflowState,
     target: WorkflowState,
@@ -53,7 +69,7 @@ def require_transition(
     has_valid_evidence: bool,
 ) -> TransitionRule:
     """Return the matching rule or raise a stable, actionable policy error."""
-    if current is WorkflowState.NEXT_STAGE_OR_FRONTEND:
+    if current in POST_MILESTONE_ONE_STATES or target in FUTURE_TARGET_STATES:
         raise FactoryError(
             "unsupported_transition",
             ErrorCategory.POLICY_BLOCKED,
