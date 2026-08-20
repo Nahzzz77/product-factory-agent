@@ -2,6 +2,31 @@
   "$defs": {
     "RequirementDeclaration": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "not_applicable"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "pattern": "\\S",
+                "type": "string"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          }
+        }
+      ],
       "properties": {
         "reason": {
           "anyOf": [

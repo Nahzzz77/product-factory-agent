@@ -89,6 +89,20 @@ def test_require_checks_id_lease_and_state_revision(tmp_path: Path) -> None:
     assert expired.value.code == "lock_expired"
 
 
+def test_mutation_propagates_business_oserror_and_releases_the_mutex(tmp_path: Path) -> None:
+    manager = LockManager(tmp_path)
+    lock = manager.acquire(owner("a"), 0, timedelta(minutes=5))
+    disk_failure = OSError("audit disk full")
+
+    with pytest.raises(OSError) as caught:
+        with manager.mutation(lock.lock_id, 0):
+            raise disk_failure
+
+    assert caught.value is disk_failure
+    with manager.mutation(lock.lock_id, 0) as active:
+        assert active == lock
+
+
 def test_takeover_replaces_only_the_expired_expected_lock(tmp_path: Path) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
     manager = LockManager(tmp_path, now_fn=lambda: current[0])

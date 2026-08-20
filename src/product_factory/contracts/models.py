@@ -43,6 +43,23 @@ class RequirementStatus(StrEnum):
 
 
 class RequirementDeclaration(StrictModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"status": {"const": "not_applicable"}},
+                        "required": ["status"],
+                    },
+                    "then": {
+                        "properties": {"reason": {"type": "string", "pattern": r"\S"}},
+                        "required": ["reason"],
+                    },
+                }
+            ]
+        },
+    )
     status: RequirementStatus
     source: str = Field(min_length=1)
     reason: str | None = None

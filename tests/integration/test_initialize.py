@@ -143,6 +143,33 @@ def test_initialize_rejects_invalid_intake_before_creating_target(tmp_path: Path
     assert not target.exists()
 
 
+def test_initialize_copies_the_same_intake_bytes_it_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    validated_bytes = intake.read_bytes()
+    unvalidated_bytes = b"not: a valid intake\n"
+    original_read_text = Path.read_text
+
+    def swap_source_after_validation(self: Path, *args: object, **kwargs: object) -> str:
+        contents = original_read_text(self, *args, **kwargs)
+        if self == intake:
+            self.write_bytes(unvalidated_bytes)
+        return contents
+
+    monkeypatch.setattr(Path, "read_text", swap_source_after_validation)
+    target = tmp_path / "new-product"
+
+    initialize_project(
+        target, "demo-web", "Demo Web", prd, intake, [("stage-01", "Core", False)], Path.cwd()
+    )
+
+    assert (target / ".product-factory/intake.yaml").read_bytes() == validated_bytes
+
+
 @pytest.mark.parametrize(
     ("intake_options", "expected_code"),
     [

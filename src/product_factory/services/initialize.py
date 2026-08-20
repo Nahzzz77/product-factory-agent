@@ -30,7 +30,10 @@ from product_factory.version import __version__
 
 def copy_baseline(source: Path, destination: Path) -> str:
     """Copy exact bytes and return their SHA-256 digest."""
-    content = source.read_bytes()
+    return _copy_baseline_bytes(source.read_bytes(), destination)
+
+
+def _copy_baseline_bytes(content: bytes, destination: Path) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(content)
     return hashlib.sha256(content).hexdigest()
@@ -64,7 +67,7 @@ def initialize_project(
     resolved_constraints = (
         _source_path(constraints_source, factory_root) if constraints_source is not None else None
     )
-    _require_valid_intake(resolved_intake)
+    intake_content = _read_valid_intake(resolved_intake)
     target.mkdir(parents=True, exist_ok=True)
     for directory in (
         target / "inputs/assets",
@@ -76,7 +79,7 @@ def initialize_project(
         directory.mkdir(parents=True, exist_ok=True)
 
     prd_digest = copy_baseline(resolved_prd, target / "inputs/PRD.md")
-    copy_baseline(resolved_intake, target / ".product-factory/intake.yaml")
+    _copy_baseline_bytes(intake_content, target / ".product-factory/intake.yaml")
     constraints_path = target / "inputs/constraints.md"
     if resolved_constraints is None:
         constraints_path.write_bytes(b"")
@@ -181,10 +184,14 @@ def _source_path(source: Path, factory_root: Path) -> Path:
     return source.resolve() if source.is_absolute() else (factory_root / source).resolve()
 
 
-def _require_valid_intake(path: Path) -> None:
+def _read_valid_intake(path: Path) -> bytes:
     try:
-        IntakeRecord.model_validate(load_yaml(path))
-    except (OSError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        content = path.read_bytes()
+        payload = yaml.safe_load(content.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"expected mapping in {path}")
+        IntakeRecord.model_validate(payload)
+    except (OSError, UnicodeDecodeError, ValidationError, ValueError, yaml.YAMLError) as exc:
         raise FactoryError(
             "intake_invalid",
             ErrorCategory.INPUT_REQUIRED,
@@ -193,6 +200,7 @@ def _require_valid_intake(path: Path) -> None:
             False,
             "修正 intake.yaml 的七类输入声明后重试",
         ) from exc
+    return content
 
 
 def _stage_plan(stage_specs: Iterable[tuple[str, str, bool]]) -> list[StagePlanItem]:

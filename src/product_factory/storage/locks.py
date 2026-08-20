@@ -251,31 +251,47 @@ class LockManager:
         try:
             self.paths.metadata.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(self.mutex_path, timeout=0, isolation_level=None)
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as exc:
-                if self._is_mutex_busy(exc):
-                    raise self._lock_busy() from exc
-                raise self._mutex_unavailable() from exc
-            try:
-                yield
-            except BaseException:
-                connection.rollback()
-                raise
-            else:
-                connection.commit()
         except (OSError, sqlite3.Error) as exc:
-            if self._is_mutex_busy(exc):
-                raise self._lock_busy() from exc
-            raise self._mutex_unavailable() from exc
-        finally:
-            if connection is not None:
+            raise self._mutex_error(exc) from exc
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except (OSError, sqlite3.Error) as exc:
+            try:
                 connection.close()
+            except (OSError, sqlite3.Error):
+                pass
+            raise self._mutex_error(exc) from exc
+
+        primary_error = False
+        try:
+            yield
+        except BaseException:
+            primary_error = True
+            try:
+                connection.rollback()
+            except (OSError, sqlite3.Error):
+                pass
+            raise
+        else:
+            try:
+                connection.commit()
+            except (OSError, sqlite3.Error) as exc:
+                primary_error = True
+                raise self._mutex_error(exc) from exc
+        finally:
+            try:
+                connection.close()
+            except (OSError, sqlite3.Error) as exc:
+                if not primary_error:
+                    raise self._mutex_error(exc) from exc
 
     def _is_mutex_busy(self, exc: BaseException) -> bool:
         return isinstance(exc, sqlite3.OperationalError) and (
             "locked" in str(exc).lower() or "busy" in str(exc).lower()
         )
+
+    def _mutex_error(self, exc: BaseException) -> FactoryError:
+        return self._lock_busy() if self._is_mutex_busy(exc) else self._mutex_unavailable()
 
     def _exclusive_create_record(self, path: Path, record: LockRecord) -> bool:
         return self._exclusive_create_payload(path, record.model_dump(mode="json"))
