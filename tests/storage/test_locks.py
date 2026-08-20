@@ -160,11 +160,14 @@ def test_expired_takeover_guard_is_recovered_before_takeover(tmp_path: Path) -> 
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
     manager = LockManager(tmp_path, now_fn=lambda: current[0])
     old = manager.acquire(owner("a"), 0, timedelta(seconds=1))
-    manager.takeover_guard_path.write_text(
-        '{"guard_id":"stale","owner":{"tool":"codex","session_id":"z","pid":1,"host":"mac"},'
-        '"acquired_at":"2026-08-20T00:00:00+00:00","expires_at":"2026-08-20T00:00:01+00:00"}\n',
-        encoding="utf-8",
+    stale = locks._TakeoverGuard(
+        "stale",
+        owner("stale"),
+        current[0] - timedelta(minutes=1),
+        current[0] - timedelta(seconds=1),
+        generation=1,
     )
+    assert manager._publish_guard_exclusive(stale)
     current[0] += timedelta(seconds=2)
 
     result = manager.takeover(
@@ -176,57 +179,6 @@ def test_expired_takeover_guard_is_recovered_before_takeover(tmp_path: Path) -> 
     )
 
     assert manager.status() == result.lock
-    assert not manager.takeover_guard_path.exists()
-
-
-def test_simultaneous_stale_guard_recovery_has_only_one_owner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-    first = LockManager(tmp_path, now_fn=lambda: now)
-    second = LockManager(tmp_path, now_fn=lambda: now)
-    first.paths.metadata.mkdir(parents=True)
-    first.takeover_guard_path.write_text(
-        '{"guard_id":"stale","owner":{"tool":"codex","session_id":"z","pid":1,"host":"mac"},'
-        '"acquired_at":"2026-08-19T00:00:00+00:00","expires_at":"2026-08-19T00:00:01+00:00"}\n',
-        encoding="utf-8",
-    )
-    second_is_ready_to_unlink = Event()
-    allow_second_to_unlink = Event()
-    original_unlink = Path.unlink
-    results = []
-    errors = []
-
-    def delay_second_unlink(path: Path, *args, **kwargs) -> None:
-        if path == second.takeover_guard_path and current_thread().name == "recover-second":
-            second_is_ready_to_unlink.set()
-            assert allow_second_to_unlink.wait(timeout=5)
-        original_unlink(path, *args, **kwargs)
-
-    monkeypatch.setattr(locks.Path, "unlink", delay_second_unlink)
-
-    def recover(manager: LockManager, session_id: str) -> None:
-        try:
-            results.append(manager._acquire_guard(owner(session_id)))
-        except FactoryError as error:
-            errors.append(error)
-
-    delayed = Thread(target=recover, args=(second, "second"), name="recover-second")
-    delayed.start()
-    assert second_is_ready_to_unlink.wait(timeout=5)
-
-    winner = Thread(target=recover, args=(first, "first"), name="recover-first")
-    winner.start()
-    winner.join(timeout=5)
-    allow_second_to_unlink.set()
-    delayed.join(timeout=5)
-
-    assert not winner.is_alive()
-    assert not delayed.is_alive()
-    assert len(results) == 1
-    assert len(errors) == 1
-    assert errors[0].code == "takeover_in_progress"
-    assert first._read_guard() == results[0]
 
 
 def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
@@ -261,62 +213,13 @@ def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
     assert original_status().lock_id == old.lock_id
 
 
-def test_retiring_old_recovery_claim_cannot_delete_successor_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
-    manager = LockManager(tmp_path, now_fn=lambda: now)
-    guard = locks._TakeoverGuard("stale", owner("stale"), now - timedelta(minutes=1), now)
-    old = locks._TakeoverRecovery(
-        recovery_id="old",
-        generation=0,
-        state="active",
-        owner=owner("old"),
-        acquired_at=now,
-        expires_at=now + timedelta(minutes=1),
-        guard=guard,
-    )
-    successor = locks._TakeoverRecovery(
-        recovery_id="successor",
-        generation=1,
-        state="active",
-        owner=owner("successor"),
-        acquired_at=now,
-        expires_at=now + timedelta(minutes=1),
-        guard=guard,
-    )
-    manager._write_recovery(old)
-    old_path = manager._recovery_claim_path(old)
-    old_is_paused = Event()
-    allow_old_retirement = Event()
-    original_atomic_write = locks.atomic_write_json
-
-    def pause_old_retirement(path: Path, payload: dict) -> None:
-        if path == old_path and payload["state"] == "retired":
-            old_is_paused.set()
-            assert allow_old_retirement.wait(timeout=5)
-        original_atomic_write(path, payload)
-
-    monkeypatch.setattr(locks, "atomic_write_json", pause_old_retirement)
-    retiring = Thread(target=manager._retire_recovery_claim, args=(old,))
-    retiring.start()
-    assert old_is_paused.wait(timeout=5)
-
-    manager._write_recovery(successor)
-    allow_old_retirement.set()
-    retiring.join(timeout=5)
-
-    assert not retiring.is_alive()
-    assert manager._read_recovery(successor) == successor
-
-
 def test_exclusive_guard_publication_never_exposes_partial_json_or_corrupts_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = datetime(2026, 8, 20, tzinfo=timezone.utc)
     manager = LockManager(tmp_path, now_fn=lambda: now)
-    guard = locks._TakeoverGuard("guard", owner("writer"), now, now + timedelta(minutes=1))
-    winner = locks._TakeoverGuard("winner", owner("winner"), now, now + timedelta(minutes=1))
+    guard = locks._TakeoverGuard("guard", owner("writer"), now, now + timedelta(minutes=1), 0)
+    winner = locks._TakeoverGuard("winner", owner("winner"), now, now + timedelta(minutes=1), 0)
     partial_write_completed = Event()
     allow_writer_to_finish = Event()
     original_write = locks.os.write
@@ -336,18 +239,67 @@ def test_exclusive_guard_publication_never_exposes_partial_json_or_corrupts_winn
 
     monkeypatch.setattr(locks.os, "write", pause_after_partial_write)
     writer = Thread(
-        target=lambda: outcome.append(manager._exclusive_create_payload(manager.takeover_guard_path, guard.payload()))
+        target=lambda: outcome.append(manager._publish_guard_exclusive(guard))
     )
     writer.start()
     assert partial_write_completed.wait(timeout=5)
 
-    assert manager._read_guard() is None
-    assert manager._exclusive_create_payload(manager.takeover_guard_path, winner.payload())
-    assert manager._read_guard() == winner
+    assert manager._read_guard_path(manager._guard_path(0)) is None
+    assert manager._publish_guard_exclusive(winner)
+    assert manager._read_guard_path(manager._guard_path(0)) == winner
 
     allow_writer_to_finish.set()
     writer.join(timeout=5)
     assert not writer.is_alive()
     assert outcome == [False]
-    assert manager._read_guard() == winner
-    assert list(manager.paths.metadata.glob("*.tmp")) == []
+    assert manager._read_guard_path(manager._guard_path(0)) == winner
+    assert list(manager.takeover_guard_dir.glob("*.tmp")) == []
+
+
+def test_expired_recoverer_cannot_replace_successor_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    stale = locks._TakeoverGuard(
+        "stale",
+        owner("stale"),
+        current[0] - timedelta(minutes=1),
+        current[0] - timedelta(seconds=1),
+        generation=0,
+    )
+    assert manager._publish_guard_exclusive(stale)
+    old_publish_started = Event()
+    allow_old_publish = Event()
+    original_publish = manager._publish_guard_exclusive
+    results = []
+    errors = []
+
+    def pause_old_generation(guard: locks._TakeoverGuard) -> bool:
+        if guard.generation == 1 and current_thread().name == "old-recoverer":
+            old_publish_started.set()
+            assert allow_old_publish.wait(timeout=5)
+        return original_publish(guard)
+
+    monkeypatch.setattr(manager, "_publish_guard_exclusive", pause_old_generation)
+
+    def acquire(session_id: str) -> None:
+        try:
+            results.append(manager._acquire_guard(owner(session_id)))
+        except FactoryError as error:
+            errors.append(error)
+
+    old = Thread(target=acquire, args=("old",), name="old-recoverer")
+    old.start()
+    assert old_publish_started.wait(timeout=5)
+
+    current[0] += timedelta(minutes=1)
+    successor = manager._acquire_guard(owner("successor"))
+    allow_old_publish.set()
+    old.join(timeout=5)
+
+    assert not old.is_alive()
+    assert results == []
+    assert len(errors) == 1
+    assert errors[0].code == "takeover_in_progress"
+    assert manager._current_guard() == successor

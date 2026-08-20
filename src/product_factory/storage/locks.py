@@ -47,6 +47,7 @@ class _TakeoverGuard:
     owner: LockOwner
     acquired_at: datetime
     expires_at: datetime
+    generation: int
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -54,28 +55,7 @@ class _TakeoverGuard:
             "owner": self.owner.model_dump(mode="json"),
             "acquired_at": self.acquired_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class _TakeoverRecovery:
-    recovery_id: str
-    generation: int
-    state: str
-    owner: LockOwner
-    acquired_at: datetime
-    expires_at: datetime
-    guard: _TakeoverGuard
-
-    def payload(self) -> dict[str, Any]:
-        return {
-            "recovery_id": self.recovery_id,
             "generation": self.generation,
-            "state": self.state,
-            "owner": self.owner.model_dump(mode="json"),
-            "acquired_at": self.acquired_at.isoformat(),
-            "expires_at": self.expires_at.isoformat(),
-            "guard": self.guard.payload(),
         }
 
 
@@ -85,8 +65,7 @@ class LockManager:
     def __init__(self, root: Path, now_fn: Callable[[], datetime] | None = None):
         self.paths = ProjectPaths(root.resolve())
         self.path = self.paths.lock
-        self.takeover_guard_path = self.path.with_name("execution-lock.takeover-guard.json")
-        self.takeover_recovery_dir = self.path.with_name("execution-lock.takeover-recovery")
+        self.takeover_guard_dir = self.path.with_name("execution-lock.takeover-guards")
         self.now = now_fn or (lambda: datetime.now(timezone.utc))
 
     def acquire(self, owner: LockOwner, state_revision: int, lease: timedelta) -> LockRecord:
@@ -328,70 +307,27 @@ class LockManager:
             self._release_guard(guard)
 
     def _acquire_guard(self, owner: LockOwner) -> _TakeoverGuard:
-        self.takeover_guard_path.parent.mkdir(parents=True, exist_ok=True)
+        self.takeover_guard_dir.mkdir(parents=True, exist_ok=True)
         while True:
             now = self._now()
-            guard = _TakeoverGuard(uuid.uuid4().hex, owner, now, now + _GUARD_LEASE)
-            if self._has_active_recovery(now):
+            latest = self._latest_guard()
+            current = None if latest is None or self._retirement_path(latest).exists() else latest
+            if current is not None and current.expires_at > now:
                 raise self._takeover_in_progress()
-            if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
+            generation = 0 if latest is None else latest.generation + 1
+            guard = _TakeoverGuard(uuid.uuid4().hex, owner, now, now + _GUARD_LEASE, generation)
+            if self._publish_guard_exclusive(guard):
                 return guard
 
-            existing = self._read_guard()
-            if existing is None:
-                continue
-            if existing.expires_at > now:
-                raise self._takeover_in_progress()
-
-            recovery = _TakeoverRecovery(
-                recovery_id=uuid.uuid4().hex,
-                generation=self._next_recovery_generation(existing.guard_id),
-                state="active",
-                owner=owner,
-                acquired_at=now,
-                expires_at=now + _GUARD_LEASE,
-                guard=existing,
-            )
-            if not self._write_recovery_exclusive(recovery):
-                raise self._takeover_in_progress()
-            try:
-                if not self._is_recovery_owner(recovery):
-                    continue
-                confirmed = self._read_guard()
-                if confirmed is None:
-                    continue
-                if (
-                    confirmed.guard_id != existing.guard_id
-                    or confirmed.expires_at != existing.expires_at
-                    or confirmed.expires_at > self._now()
-                ):
-                    continue
-                self.takeover_guard_path.unlink()
-                _fsync_parent_directory(self.takeover_guard_path)
-                self._retire_recovery_claim(recovery)
-                if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
-                    return guard
-            finally:
-                if self._now() < recovery.expires_at:
-                    self._retire_recovery_claim(recovery)
-
     def _release_guard(self, guard: _TakeoverGuard) -> None:
-        # Once its own lease has elapsed, this caller may no longer remove the
-        # guard: a later contender is entitled to recover it.
-        if self._now() >= guard.expires_at:
-            return
-        current = self._read_guard()
-        if current is None or current.guard_id != guard.guard_id:
-            return
-        try:
-            self.takeover_guard_path.unlink()
-            _fsync_parent_directory(self.takeover_guard_path)
-        except FileNotFoundError:
-            return
+        self._exclusive_create_payload(
+            self._retirement_path(guard),
+            {"generation": guard.generation, "guard_id": guard.guard_id},
+        )
 
-    def _read_guard(self) -> _TakeoverGuard | None:
+    def _read_guard_path(self, path: Path) -> _TakeoverGuard | None:
         try:
-            payload = json.loads(self.takeover_guard_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
             return self._parse_guard(payload)
         except FileNotFoundError:
             return None
@@ -405,48 +341,6 @@ class LockManager:
                 "检查并移除损坏的接管保护文件",
             ) from exc
 
-    def _read_recovery(self, recovery: _TakeoverRecovery) -> _TakeoverRecovery | None:
-        return self._read_recovery_path(self._recovery_claim_path(recovery))
-
-    def _read_recovery_path(self, path: Path) -> _TakeoverRecovery | None:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("recovery must be a JSON object")
-            recovery_id = payload["recovery_id"]
-            if not isinstance(recovery_id, str) or not recovery_id:
-                raise ValueError("recovery_id must be a non-empty string")
-            generation = payload["generation"]
-            if not isinstance(generation, int) or generation < 0:
-                raise ValueError("generation must be a non-negative integer")
-            state = payload["state"]
-            if state not in {"active", "retired"}:
-                raise ValueError("recovery state is invalid")
-            acquired_at = datetime.fromisoformat(payload["acquired_at"])
-            expires_at = datetime.fromisoformat(payload["expires_at"])
-            if acquired_at.tzinfo is None or expires_at.tzinfo is None:
-                raise ValueError("recovery timestamps must be timezone-aware")
-            return _TakeoverRecovery(
-                recovery_id=recovery_id,
-                generation=generation,
-                state=state,
-                owner=LockOwner.model_validate(payload["owner"]),
-                acquired_at=acquired_at,
-                expires_at=expires_at,
-                guard=self._parse_guard(payload["guard"]),
-            )
-        except FileNotFoundError:
-            return None
-        except (json.JSONDecodeError, KeyError, TypeError, ValidationError, ValueError) as exc:
-            raise FactoryError(
-                "takeover_recovery_invalid",
-                ErrorCategory.ENVIRONMENT_BLOCKED,
-                "接管恢复声明无效，已保留以避免误删",
-                "lock takeover",
-                True,
-                "检查并移除损坏的接管恢复声明",
-            ) from exc
-
     def _parse_guard(self, payload: Any) -> _TakeoverGuard:
         if not isinstance(payload, dict):
             raise ValueError("guard must be a JSON object")
@@ -455,72 +349,46 @@ class LockManager:
             raise ValueError("guard_id must be a non-empty string")
         acquired_at = datetime.fromisoformat(payload["acquired_at"])
         expires_at = datetime.fromisoformat(payload["expires_at"])
+        generation = payload["generation"]
         if acquired_at.tzinfo is None or expires_at.tzinfo is None:
             raise ValueError("guard timestamps must be timezone-aware")
+        if not isinstance(generation, int) or generation < 0:
+            raise ValueError("generation must be a non-negative integer")
         return _TakeoverGuard(
             guard_id=guard_id,
             owner=LockOwner.model_validate(payload["owner"]),
             acquired_at=acquired_at,
             expires_at=expires_at,
+            generation=generation,
         )
 
-    def _recovery_claim_path(self, recovery: _TakeoverRecovery) -> Path:
-        return self.takeover_recovery_dir / f"{recovery.guard.guard_id}.{recovery.generation:020d}.json"
+    def _guard_path(self, generation: int) -> Path:
+        return self.takeover_guard_dir / f"{generation:020d}.json"
 
-    def _write_recovery(self, recovery: _TakeoverRecovery) -> None:
-        atomic_write_json(self._recovery_claim_path(recovery), recovery.payload())
+    def _retirement_path(self, guard: _TakeoverGuard) -> Path:
+        return self.takeover_guard_dir / f"{guard.generation:020d}.retired.json"
 
-    def _write_recovery_exclusive(self, recovery: _TakeoverRecovery) -> bool:
-        self.takeover_recovery_dir.mkdir(parents=True, exist_ok=True)
-        return self._exclusive_create_payload(self._recovery_claim_path(recovery), recovery.payload())
+    def _publish_guard_exclusive(self, guard: _TakeoverGuard) -> bool:
+        return self._exclusive_create_payload(self._guard_path(guard.generation), guard.payload())
 
-    def _retire_recovery_claim(self, recovery: _TakeoverRecovery) -> None:
-        current = self._read_recovery(recovery)
-        if current is None or current.recovery_id != recovery.recovery_id or current.state == "retired":
-            return
-        self._write_recovery(
-            _TakeoverRecovery(
-                recovery_id=recovery.recovery_id,
-                generation=recovery.generation,
-                state="retired",
-                owner=recovery.owner,
-                acquired_at=recovery.acquired_at,
-                expires_at=recovery.expires_at,
-                guard=recovery.guard,
-            )
-        )
+    def _latest_guard(self) -> _TakeoverGuard | None:
+        if not self.takeover_guard_dir.exists():
+            return None
+        candidates = [
+            path
+            for path in self.takeover_guard_dir.glob("*.json")
+            if path.stem.isdigit()
+        ]
+        if not candidates:
+            return None
+        latest_path = max(candidates, key=lambda path: int(path.stem))
+        return self._read_guard_path(latest_path)
 
-    def _recoveries_for_guard(self, guard_id: str) -> list[_TakeoverRecovery]:
-        if not self.takeover_recovery_dir.exists():
-            return []
-        recoveries: list[_TakeoverRecovery] = []
-        for path in self.takeover_recovery_dir.glob(f"{guard_id}.*.json"):
-            recovery = self._read_recovery_path(path)
-            if recovery is not None and recovery.guard.guard_id == guard_id:
-                recoveries.append(recovery)
-        return recoveries
-
-    def _next_recovery_generation(self, guard_id: str) -> int:
-        recoveries = self._recoveries_for_guard(guard_id)
-        return max((recovery.generation for recovery in recoveries), default=-1) + 1
-
-    def _is_recovery_owner(self, recovery: _TakeoverRecovery) -> bool:
-        if self._now() >= recovery.expires_at:
-            return False
-        current = self._read_recovery(recovery)
-        if current is None or current.recovery_id != recovery.recovery_id or current.state != "active":
-            return False
-        latest = max(self._recoveries_for_guard(recovery.guard.guard_id), key=lambda item: item.generation)
-        return latest.recovery_id == recovery.recovery_id and latest.state == "active"
-
-    def _has_active_recovery(self, now: datetime) -> bool:
-        if not self.takeover_recovery_dir.exists():
-            return False
-        for path in self.takeover_recovery_dir.glob("*.json"):
-            recovery = self._read_recovery_path(path)
-            if recovery is not None and recovery.state == "active" and recovery.expires_at > now:
-                return True
-        return False
+    def _current_guard(self) -> _TakeoverGuard | None:
+        latest = self._latest_guard()
+        if latest is None or self._retirement_path(latest).exists():
+            return None
+        return latest
 
     def _takeover_in_progress(self) -> FactoryError:
         return FactoryError(
