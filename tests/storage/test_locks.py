@@ -1,11 +1,14 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
+import subprocess
+import sys
 from threading import Event, Thread, current_thread
 
 import pytest
 
-from product_factory.contracts.models import LockOwner
+from product_factory.contracts.models import LockOwner, LockRecord
 from product_factory.errors import FactoryError
 from product_factory.storage import locks
 from product_factory.storage.files import atomic_write_json
@@ -152,36 +155,11 @@ def test_concurrent_takeovers_never_remove_the_replacement_lock(tmp_path: Path) 
 
     assert len(results) == 1
     assert len(errors) == 1
-    assert errors[0].code in {"lock_required", "takeover_in_progress"}
+    assert errors[0].code in {"lock_busy", "lock_required"}
     assert LockManager(tmp_path, now_fn=lambda: expired).status() == results[0].lock
 
 
-def test_expired_takeover_guard_is_recovered_before_takeover(tmp_path: Path) -> None:
-    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
-    manager = LockManager(tmp_path, now_fn=lambda: current[0])
-    old = manager.acquire(owner("a"), 0, timedelta(seconds=1))
-    stale = locks._TakeoverGuard(
-        "stale",
-        owner("stale"),
-        current[0] - timedelta(minutes=1),
-        current[0] - timedelta(seconds=1),
-        generation=1,
-    )
-    assert manager._publish_guard_exclusive(stale)
-    current[0] += timedelta(seconds=2)
-
-    result = manager.takeover(
-        old.lock_id,
-        owner("b"),
-        0,
-        "stale guard recovered",
-        timedelta(minutes=5),
-    )
-
-    assert manager.status() == result.lock
-
-
-def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
+def test_takeover_rejects_same_id_with_changed_expiry_inside_mutex(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
@@ -213,13 +191,13 @@ def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
     assert original_status().lock_id == old.lock_id
 
 
-def test_exclusive_guard_publication_never_exposes_partial_json_or_corrupts_winner(
+def test_exclusive_lock_publication_never_exposes_partial_json_or_corrupts_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     now = datetime(2026, 8, 20, tzinfo=timezone.utc)
     manager = LockManager(tmp_path, now_fn=lambda: now)
-    guard = locks._TakeoverGuard("guard", owner("writer"), now, now + timedelta(minutes=1), 0)
-    winner = locks._TakeoverGuard("winner", owner("winner"), now, now + timedelta(minutes=1), 0)
+    record = manager._new_record(owner("writer"), 0, timedelta(minutes=1))
+    winner = manager._new_record(owner("winner"), 0, timedelta(minutes=1))
     partial_write_completed = Event()
     allow_writer_to_finish = Event()
     original_write = locks.os.write
@@ -239,73 +217,24 @@ def test_exclusive_guard_publication_never_exposes_partial_json_or_corrupts_winn
 
     monkeypatch.setattr(locks.os, "write", pause_after_partial_write)
     writer = Thread(
-        target=lambda: outcome.append(manager._publish_guard_exclusive(guard))
+        target=lambda: outcome.append(manager._exclusive_create_record(manager.path, record))
     )
     writer.start()
     assert partial_write_completed.wait(timeout=5)
 
-    assert manager._read_guard_path(manager._guard_path(0)) is None
-    assert manager._publish_guard_exclusive(winner)
-    assert manager._read_guard_path(manager._guard_path(0)) == winner
+    assert manager.status() is None
+    assert manager._exclusive_create_record(manager.path, winner)
+    assert manager.status() == winner
 
     allow_writer_to_finish.set()
     writer.join(timeout=5)
     assert not writer.is_alive()
     assert outcome == [False]
-    assert manager._read_guard_path(manager._guard_path(0)) == winner
-    assert list(manager.takeover_guard_dir.glob("*.tmp")) == []
+    assert manager.status() == winner
+    assert list(manager.paths.metadata.glob("*.tmp")) == []
 
 
-def test_expired_recoverer_cannot_replace_successor_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
-    manager = LockManager(tmp_path, now_fn=lambda: current[0])
-    stale = locks._TakeoverGuard(
-        "stale",
-        owner("stale"),
-        current[0] - timedelta(minutes=1),
-        current[0] - timedelta(seconds=1),
-        generation=0,
-    )
-    assert manager._publish_guard_exclusive(stale)
-    old_publish_started = Event()
-    allow_old_publish = Event()
-    original_publish = manager._publish_guard_exclusive
-    results = []
-    errors = []
-
-    def pause_old_generation(guard: locks._TakeoverGuard) -> bool:
-        if guard.generation == 1 and current_thread().name == "old-recoverer":
-            old_publish_started.set()
-            assert allow_old_publish.wait(timeout=5)
-        return original_publish(guard)
-
-    monkeypatch.setattr(manager, "_publish_guard_exclusive", pause_old_generation)
-
-    def acquire(session_id: str) -> None:
-        try:
-            results.append(manager._acquire_guard(owner(session_id)))
-        except FactoryError as error:
-            errors.append(error)
-
-    old = Thread(target=acquire, args=("old",), name="old-recoverer")
-    old.start()
-    assert old_publish_started.wait(timeout=5)
-
-    current[0] += timedelta(minutes=1)
-    successor = manager._acquire_guard(owner("successor"))
-    allow_old_publish.set()
-    old.join(timeout=5)
-
-    assert not old.is_alive()
-    assert results == []
-    assert len(errors) == 1
-    assert errors[0].code == "takeover_in_progress"
-    assert manager._current_guard() == successor
-
-
-def test_expired_takeover_cannot_commit_below_successor_fence(
+def test_mutation_mutex_blocks_expired_takeover_until_original_commits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
@@ -314,18 +243,17 @@ def test_expired_takeover_cannot_commit_below_successor_fence(
     current[0] += timedelta(seconds=2)
     old_commit_started = Event()
     allow_old_commit = Event()
-    original_commit = manager._commit_transition
+    original_replace = manager._replace_expired_lock
     results = []
     errors = []
 
-    def pause_old_commit(*args, **kwargs):
-        guard = args[0]
-        if guard.generation == 1 and current_thread().name == "old-takeover":
+    def pause_old_replace(*args, **kwargs):
+        if current_thread().name == "old-takeover":
             old_commit_started.set()
             assert allow_old_commit.wait(timeout=5)
-        return original_commit(*args, **kwargs)
+        return original_replace(*args, **kwargs)
 
-    monkeypatch.setattr(manager, "_commit_transition", pause_old_commit)
+    monkeypatch.setattr(manager, "_replace_expired_lock", pause_old_replace)
 
     def old_takeover() -> None:
         try:
@@ -345,85 +273,120 @@ def test_expired_takeover_cannot_commit_below_successor_fence(
     old.start()
     assert old_commit_started.wait(timeout=5)
 
-    current[0] += timedelta(seconds=31)
-    successor = manager.takeover(
-        old_lock.lock_id,
-        owner("successor"),
-        2,
-        "fence expired predecessor",
-        timedelta(minutes=5),
-    )
-    assert manager.status() == successor.lock
+    current[0] += timedelta(minutes=1)
+    with pytest.raises(FactoryError) as blocked:
+        manager.takeover(
+            old_lock.lock_id,
+            owner("successor"),
+            2,
+            "cannot pass mutex",
+            timedelta(minutes=5),
+        )
+    assert blocked.value.code == "lock_busy"
     allow_old_commit.set()
     old.join(timeout=5)
 
     assert not old.is_alive()
-    assert results == []
-    assert len(errors) == 1
-    assert errors[0].code == "lock_changed"
-    assert manager.status() == successor.lock
+    assert errors == []
+    assert len(results) == 1
+    assert manager.status() == results[0].lock
+    assert LockRecord.model_validate_json(manager.path.read_text(encoding="utf-8")) == results[0].lock
 
 
-@pytest.mark.parametrize("operation", ["heartbeat", "release"])
-def test_late_low_generation_mutation_cannot_override_successor_fence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+def test_heartbeat_and_release_are_serialized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
     manager = LockManager(tmp_path, now_fn=lambda: current[0])
-    old_lock = manager.acquire(owner("old"), 0, timedelta(seconds=10))
-    old_commit_started = Event()
-    allow_old_commit = Event()
-    original_commit = manager._commit_transition
-    errors = []
+    lock = manager.acquire(owner("old"), 0, timedelta(minutes=5))
+    heartbeat_started = Event()
+    allow_heartbeat = Event()
+    original_replace = manager._replace_record
+    errors: list[FactoryError] = []
 
-    def pause_old_commit(*args, **kwargs):
-        guard = args[0]
-        if guard.generation == 1 and current_thread().name == f"old-{operation}":
-            old_commit_started.set()
-            assert allow_old_commit.wait(timeout=5)
-        return original_commit(*args, **kwargs)
+    def pause_heartbeat_replace(*args, **kwargs):
+        if current_thread().name == "heartbeat":
+            heartbeat_started.set()
+            assert allow_heartbeat.wait(timeout=5)
+        return original_replace(*args, **kwargs)
 
-    monkeypatch.setattr(manager, "_commit_transition", pause_old_commit)
+    monkeypatch.setattr(manager, "_replace_record", pause_heartbeat_replace)
 
-    def delayed_mutation() -> None:
+    def heartbeat() -> None:
         try:
-            if operation == "heartbeat":
-                manager.heartbeat(old_lock.lock_id, timedelta(minutes=5))
-            else:
-                manager.release(old_lock.lock_id)
+            manager.heartbeat(lock.lock_id, timedelta(minutes=10))
         except FactoryError as error:
             errors.append(error)
 
-    delayed = Thread(target=delayed_mutation, name=f"old-{operation}")
-    delayed.start()
-    assert old_commit_started.wait(timeout=5)
+    worker = Thread(target=heartbeat, name="heartbeat")
+    worker.start()
+    assert heartbeat_started.wait(timeout=5)
 
-    current[0] += timedelta(seconds=31)
-    successor = manager.takeover(
-        old_lock.lock_id,
-        owner("successor"),
-        2,
-        "fence expired predecessor",
-        timedelta(minutes=5),
-    )
-    assert manager.status() == successor.lock
-    allow_old_commit.set()
-    delayed.join(timeout=5)
+    with pytest.raises(FactoryError) as blocked:
+        manager.release(lock.lock_id)
+    assert blocked.value.code == "lock_busy"
+    allow_heartbeat.set()
+    worker.join(timeout=5)
 
-    assert not delayed.is_alive()
-    assert len(errors) == 1
-    assert errors[0].code == "lock_owner_mismatch"
-    assert manager.status() == successor.lock
+    assert not worker.is_alive()
+    assert errors == []
+    assert manager.status() is not None
+    manager.release(lock.lock_id)
+    assert manager.status() is None
 
 
-def test_status_uses_highest_transition_even_if_projection_is_stale(tmp_path: Path) -> None:
+def test_status_is_read_only_and_reads_a_legacy_canonical_lock(tmp_path: Path) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
     manager = LockManager(tmp_path, now_fn=lambda: current[0])
-    original = manager.acquire(owner("old"), 0, timedelta(seconds=10))
-    current[0] += timedelta(seconds=1)
-    refreshed = manager.heartbeat(original.lock_id, timedelta(minutes=5))
+    record = manager._new_record(owner("legacy"), 0, timedelta(minutes=5))
+    atomic_write_json(manager.path, record.model_dump(mode="json"))
+    content_before = manager.path.read_text(encoding="utf-8")
+    file_mtime_before = manager.path.stat().st_mtime_ns
+    directory_entries_before = sorted(path.name for path in manager.paths.metadata.iterdir())
+    directory_mtime_before = manager.paths.metadata.stat().st_mtime_ns
 
-    atomic_write_json(manager.path, original.model_dump(mode="json"))
+    assert manager.status() == record
 
-    assert manager.status() == refreshed
-    assert manager.require(refreshed.lock_id, 0) == refreshed
+    assert manager.path.read_text(encoding="utf-8") == content_before
+    assert manager.path.stat().st_mtime_ns == file_mtime_before
+    assert sorted(path.name for path in manager.paths.metadata.iterdir()) == directory_entries_before
+    assert manager.paths.metadata.stat().st_mtime_ns == directory_mtime_before
+    assert not manager.mutex_path.exists()
+
+
+def test_mutex_is_released_when_holder_process_is_terminated(tmp_path: Path) -> None:
+    source_root = Path(__file__).parents[2] / "src"
+    script = "\n".join(
+        [
+            "from pathlib import Path",
+            "from product_factory.storage.locks import LockManager",
+            "import sys, time",
+            f"manager = LockManager(Path({str(tmp_path)!r}))",
+            "with manager._mutation_mutex():",
+            "    print('locked', flush=True)",
+            "    time.sleep(30)",
+        ]
+    )
+    environment = {**os.environ, "PYTHONPATH": str(source_root)}
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        cwd=source_root.parent,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline() == "locked\n"
+        process.terminate()
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    manager = LockManager(tmp_path)
+    record = manager.acquire(owner("recovered"), 0, timedelta(minutes=5))
+
+    assert manager.status() == record
