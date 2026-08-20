@@ -11,6 +11,7 @@ from product_factory.contracts.models import (
 )
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.storage.files import (
+    _fsync_parent_directory,
     append_jsonl,
     atomic_write_json,
     atomic_write_yaml,
@@ -100,6 +101,10 @@ class ProjectRepository:
                 False,
                 "使用新的 evidence_id",
             ) from exc
+        # Persist the newly-created directory entry before manifest publication.
+        # Unsupported Windows directory handles are tolerated by the shared
+        # Task 3 helper; every other durability error leaves this ID reserved.
+        _fsync_parent_directory(directory)
         path = directory / "manifest.json"
         # If durable publication fails, retain the reservation.  Future calls
         # must use a new ID rather than overwriting an interrupted evidence run.

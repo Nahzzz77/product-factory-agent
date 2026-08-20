@@ -157,12 +157,50 @@ def test_failed_manifest_publication_keeps_the_evidence_id_reserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = ProjectRepository(tmp_path)
+    synced: list[Path] = []
+
+    def record_reservation_sync(path: Path) -> None:
+        synced.append(path)
 
     def fail_publication(*_args: object, **_kwargs: object) -> None:
         raise OSError("disk full")
 
+    monkeypatch.setattr(repository_module, "_fsync_parent_directory", record_reservation_sync)
     monkeypatch.setattr(repository_module, "atomic_write_json", fail_publication)
     with pytest.raises(OSError):
+        repo.save_evidence(make_evidence("b" * 64))
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    assert synced == [directory]
+    assert directory.is_dir()
+    assert not (directory / "manifest.json").exists()
+    with pytest.raises(FactoryError) as caught:
+        repo.save_evidence(make_evidence("c" * 64))
+    assert caught.value.code == "evidence_exists"
+
+
+def test_evidence_reservation_syncs_parent_before_successful_manifest_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = ProjectRepository(tmp_path)
+    synced: list[Path] = []
+    monkeypatch.setattr(repository_module, "_fsync_parent_directory", synced.append)
+
+    path = repo.save_evidence(make_evidence("b" * 64))
+
+    assert synced == [path.parent]
+    assert path.is_file()
+
+
+def test_evidence_reservation_sync_failure_propagates_and_keeps_id_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = ProjectRepository(tmp_path)
+
+    def fail_reservation_sync(_path: Path) -> None:
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr(repository_module, "_fsync_parent_directory", fail_reservation_sync)
+    with pytest.raises(OSError, match="directory sync failed"):
         repo.save_evidence(make_evidence("b" * 64))
     directory = repo.evidence_path("stage-01", "evidence-01").parent
     assert directory.is_dir()
