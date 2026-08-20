@@ -157,20 +157,32 @@ def test_failed_manifest_publication_keeps_the_evidence_id_reserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = ProjectRepository(tmp_path)
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    events: list[str] = []
     synced: list[Path] = []
+    original_mkdir = repository_module.os.mkdir
+
+    def track_reservation_mkdir(path: str | Path, *args: object, **kwargs: object) -> None:
+        original_mkdir(path, *args, **kwargs)
+        if Path(path) == directory:
+            events.append("mkdir")
 
     def record_reservation_sync(path: Path) -> None:
         synced.append(path)
+        if path == directory:
+            events.append("fsync")
 
     def fail_publication(*_args: object, **_kwargs: object) -> None:
+        events.append("write")
         raise OSError("disk full")
 
+    monkeypatch.setattr(repository_module.os, "mkdir", track_reservation_mkdir)
     monkeypatch.setattr(repository_module, "_fsync_parent_directory", record_reservation_sync)
     monkeypatch.setattr(repository_module, "atomic_write_json", fail_publication)
     with pytest.raises(OSError):
         repo.save_evidence(make_evidence("b" * 64))
-    directory = repo.evidence_path("stage-01", "evidence-01").parent
     assert synced == [directory]
+    assert events == ["mkdir", "fsync", "write"]
     assert directory.is_dir()
     assert not (directory / "manifest.json").exists()
     with pytest.raises(FactoryError) as caught:
@@ -182,12 +194,37 @@ def test_evidence_reservation_syncs_parent_before_successful_manifest_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = ProjectRepository(tmp_path)
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    events: list[str] = []
     synced: list[Path] = []
-    monkeypatch.setattr(repository_module, "_fsync_parent_directory", synced.append)
+    original_mkdir = repository_module.os.mkdir
+    original_fsync_parent = repository_module._fsync_parent_directory
+    original_atomic_write = repository_module.atomic_write_json
+
+    def track_reservation_mkdir(path: str | Path, *args: object, **kwargs: object) -> None:
+        original_mkdir(path, *args, **kwargs)
+        if Path(path) == directory:
+            events.append("mkdir")
+
+    def track_reservation_sync(path: Path) -> None:
+        if path == directory:
+            events.append("fsync")
+            synced.append(path)
+        original_fsync_parent(path)
+
+    def track_manifest_write(path: Path, *args: object, **kwargs: object) -> None:
+        if path == directory / "manifest.json":
+            events.append("write")
+        original_atomic_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module.os, "mkdir", track_reservation_mkdir)
+    monkeypatch.setattr(repository_module, "_fsync_parent_directory", track_reservation_sync)
+    monkeypatch.setattr(repository_module, "atomic_write_json", track_manifest_write)
 
     path = repo.save_evidence(make_evidence("b" * 64))
 
     assert synced == [path.parent]
+    assert events == ["mkdir", "fsync", "write"]
     assert path.is_file()
 
 
@@ -195,14 +232,28 @@ def test_evidence_reservation_sync_failure_propagates_and_keeps_id_reserved(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo = ProjectRepository(tmp_path)
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    events: list[str] = []
+    original_mkdir = repository_module.os.mkdir
+
+    def track_reservation_mkdir(path: str | Path, *args: object, **kwargs: object) -> None:
+        original_mkdir(path, *args, **kwargs)
+        if Path(path) == directory:
+            events.append("mkdir")
 
     def fail_reservation_sync(_path: Path) -> None:
+        events.append("fsync")
         raise OSError("directory sync failed")
 
+    def should_not_write(*_args: object, **_kwargs: object) -> None:
+        events.append("write")
+
+    monkeypatch.setattr(repository_module.os, "mkdir", track_reservation_mkdir)
     monkeypatch.setattr(repository_module, "_fsync_parent_directory", fail_reservation_sync)
+    monkeypatch.setattr(repository_module, "atomic_write_json", should_not_write)
     with pytest.raises(OSError, match="directory sync failed"):
         repo.save_evidence(make_evidence("b" * 64))
-    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    assert events == ["mkdir", "fsync"]
     assert directory.is_dir()
     assert not (directory / "manifest.json").exists()
     with pytest.raises(FactoryError) as caught:
