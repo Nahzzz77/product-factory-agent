@@ -15,6 +15,7 @@ from product_factory.errors import FactoryError
 from product_factory.services import initialize as initialize_service
 from product_factory.services.initialize import check_inputs, initialize_project
 from product_factory.services.mutations import commit_state_change
+from product_factory.storage import files
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
@@ -340,6 +341,81 @@ def test_initialize_keeps_a_safe_nested_handbook_path_and_digest(tmp_path: Path)
     reference = ProjectRepository(tmp_path / "target").load_project().handbooks[0]
     assert reference.path == "references/handbooks/nested/guide.md"
     assert reference.sha256 == hashlib.sha256(handbook_bytes).hexdigest()
+
+
+@pytest.mark.parametrize("preexisting_empty_target", [False, True])
+@pytest.mark.parametrize("replace_after_open", [False, True])
+def test_initialize_rejects_handbook_replacement_races_without_hashing_outside_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, preexisting_empty_target: bool, replace_after_open: bool
+) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    factory_root = tmp_path / "factory"
+    handbook = factory_root / "references/handbooks/nested/guide.md"
+    handbook.parent.mkdir(parents=True)
+    handbook.write_bytes(b"inside handbook\n")
+    outside = tmp_path / "outside.md"
+    outside_bytes = b"outside handbook must never be hashed\n"
+    outside.write_bytes(outside_bytes)
+    manifest = factory_root / "references/handbooks/manifest.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "title": "Race",
+                        "version": "1",
+                        "path": "references/handbooks/nested/guide.md",
+                        # A vulnerable reopen-by-path implementation would accept this.
+                        "sha256": hashlib.sha256(outside_bytes).hexdigest(),
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    if preexisting_empty_target:
+        target.mkdir()
+
+    if replace_after_open:
+        original_read = files._read_descriptor
+        replaced = False
+
+        def replace_after_descriptor_open(descriptor: int) -> bytes:
+            nonlocal replaced
+            if not replaced:
+                replaced = True
+                handbook.unlink()
+                handbook.symlink_to(outside)
+            return original_read(descriptor)
+
+        monkeypatch.setattr(files, "_read_descriptor", replace_after_descriptor_open)
+    else:
+        original_open = files.os.open
+        replaced = False
+
+        def replace_before_final_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+            nonlocal replaced
+            if not replaced and path == "guide.md" and "dir_fd" in kwargs:
+                replaced = True
+                handbook.unlink()
+                handbook.symlink_to(outside)
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(files.os, "open", replace_before_final_open)
+
+    with pytest.raises(FactoryError) as caught:
+        initialize_project(
+            target, "demo-web", "Demo", prd, intake, [("stage-01", "Core", False)], factory_root
+        )
+
+    assert caught.value.code == "handbook_invalid"
+    assert list(target.iterdir()) == [] if target.exists() else not target.exists()
 
 
 def test_initialize_rejects_invalid_intake_before_creating_target(tmp_path: Path) -> None:

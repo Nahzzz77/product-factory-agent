@@ -12,8 +12,8 @@ from product_factory.contracts.models import (
 from product_factory.domain.approvals import APPROVAL_STATEMENT
 from product_factory.errors import FactoryError
 from product_factory.services.initialize import check_inputs, initialize_project
-from product_factory.services import workflow as workflow_service
 from product_factory.services.workflow import WorkflowService
+from product_factory.storage import files
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
@@ -303,7 +303,7 @@ def test_descriptor_snapshot_rejects_replacement_with_an_outside_symlink(
     artifact.write_text("inside", encoding="utf-8")
     outside = tmp_path / "outside.md"
     outside.write_text("outside-secret", encoding="utf-8")
-    original_open = workflow_service.os.open
+    original_open = files.os.open
     replaced = False
 
     def replace_before_file_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
@@ -314,7 +314,7 @@ def test_descriptor_snapshot_rejects_replacement_with_an_outside_symlink(
             artifact.symlink_to(outside)
         return original_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(workflow_service.os, "open", replace_before_file_open)
+    monkeypatch.setattr(files.os, "open", replace_before_file_open)
     lock = _lock(root, 1)
     with pytest.raises(FactoryError) as caught:
         WorkflowService(root).request_approval(

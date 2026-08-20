@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
-import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -23,6 +21,7 @@ from product_factory.domain.approvals import APPROVAL_STATEMENT, require_exact_a
 from product_factory.domain.states import require_transition
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.mutations import commit_state_change
+from product_factory.storage.files import read_contained_regular_bytes
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
@@ -373,78 +372,11 @@ class WorkflowService:
             raise self._error("approval_artifact_invalid", "审批工件必须位于项目目录内", step) from exc
         if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
             raise self._error("approval_artifact_invalid", "审批工件路径无效", step)
-        if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
-            return self._posix_artifact_snapshot(relative, step)
-        return self._windows_artifact_snapshot(supplied, relative, step)
-
-    def _posix_artifact_snapshot(self, relative: Path, step: str) -> tuple[str, bytes]:
-        """Open each component beneath the root, retaining the exact verified file descriptor."""
-        directory_fd: int | None = None
-        file_fd: int | None = None
         try:
-            directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
-            nofollow = os.O_NOFOLLOW
-            for part in relative.parts[:-1]:
-                next_fd = os.open(
-                    part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=directory_fd
-                )
-                os.close(directory_fd)
-                directory_fd = next_fd
-            file_fd = os.open(relative.parts[-1], os.O_RDONLY | nofollow, dir_fd=directory_fd)
-            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
-                raise OSError("approval artifact is not a regular file")
-            content = self._read_descriptor(file_fd)
-            return relative.as_posix(), content
-        except OSError as exc:
+            content = read_contained_regular_bytes(self.root, relative.parts)
+        except ValueError as exc:
             raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读普通文件", step) from exc
-        finally:
-            if file_fd is not None:
-                os.close(file_fd)
-            if directory_fd is not None:
-                os.close(directory_fd)
-
-    def _windows_artifact_snapshot(
-        self, supplied: Path, relative: Path, step: str
-    ) -> tuple[str, bytes]:
-        """Fallback identity checks where Windows cannot supply O_NOFOLLOW reliably."""
-        descriptor: int | None = None
-        try:
-            before = supplied.lstat()
-            if stat.S_ISLNK(before.st_mode):
-                raise OSError("approval artifact is a symlink")
-            resolved = supplied.resolve(strict=True)
-            resolved.relative_to(self.root)
-            descriptor = os.open(supplied, os.O_RDONLY)
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise OSError("approval artifact is not a regular file")
-            content = self._read_descriptor(descriptor)
-            after = supplied.lstat()
-            followed = supplied.stat()
-            if (
-                stat.S_ISLNK(after.st_mode)
-                or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
-                or (opened.st_dev, opened.st_ino) != (followed.st_dev, followed.st_ino)
-            ):
-                raise OSError("approval artifact changed while being read")
-            # Resolve again after the descriptor read so a replacement cannot turn a
-            # project path into an escaped path between the checks above.
-            supplied.resolve(strict=True).relative_to(self.root)
-            return relative.as_posix(), content
-        except (OSError, ValueError) as exc:
-            raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读普通文件", step) from exc
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-
-    @staticmethod
-    def _read_descriptor(descriptor: int) -> bytes:
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
+        return relative.as_posix(), content
 
     @staticmethod
     def _error(

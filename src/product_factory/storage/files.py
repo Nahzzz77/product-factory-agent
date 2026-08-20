@@ -1,6 +1,7 @@
 import errno
 import json
 import os
+import stat
 import uuid
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,102 @@ def contained_path(root: Path, relative: str) -> Path:
     if candidate != resolved_root and resolved_root not in candidate.parents:
         raise ValueError("path is outside project root")
     return candidate
+
+
+def read_contained_regular_bytes(root: Path, parts: tuple[str, ...]) -> bytes:
+    """Read one project-contained regular file from the same verified descriptor.
+
+    Callers supply already-normalized relative components.  POSIX opens every
+    component from a root directory descriptor with ``O_NOFOLLOW``; the fallback
+    retains descriptor/path identity checks for platforms without that primitive.
+    """
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("unsafe relative file path")
+    resolved_root = root.resolve()
+    candidate = resolved_root.joinpath(*parts)
+    try:
+        resolved_before = candidate.resolve(strict=True)
+        _require_contained(resolved_root, resolved_before)
+        if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+            return _read_posix_contained_file(resolved_root, candidate, parts)
+        return _read_fallback_contained_file(resolved_root, candidate)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("contained regular file is invalid or changed") from exc
+
+
+def _read_posix_contained_file(root: Path, candidate: Path, parts: tuple[str, ...]) -> bytes:
+    directory_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        before = candidate.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise ValueError("symlink is not a regular file")
+        _require_contained(root, candidate.resolve(strict=True))
+        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
+            )
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("not a regular file")
+        content = _read_descriptor(file_fd)
+        _require_path_identity(root, candidate, opened)
+        return content
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
+def _read_fallback_contained_file(root: Path, candidate: Path) -> bytes:
+    descriptor: int | None = None
+    try:
+        before = candidate.lstat()
+        if stat.S_ISLNK(before.st_mode):
+            raise ValueError("symlink is not a regular file")
+        _require_contained(root, candidate.resolve(strict=True))
+        descriptor = os.open(candidate, os.O_RDONLY)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("not a regular file")
+        content = _read_descriptor(descriptor)
+        _require_path_identity(root, candidate, opened)
+        return content
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _require_path_identity(root: Path, candidate: Path, opened: os.stat_result) -> None:
+    after = candidate.lstat()
+    if stat.S_ISLNK(after.st_mode):
+        raise ValueError("file changed to a symlink")
+    followed = candidate.stat()
+    if (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino) or (
+        opened.st_dev,
+        opened.st_ino,
+    ) != (followed.st_dev, followed.st_ino):
+        raise ValueError("file changed while being read")
+    _require_contained(root, candidate.resolve(strict=True))
+
+
+def _require_contained(root: Path, candidate: Path) -> None:
+    if candidate == root or root not in candidate.parents:
+        raise ValueError("path is outside root")
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
 
 
 def _fsync_parent_directory(path: Path) -> None:
