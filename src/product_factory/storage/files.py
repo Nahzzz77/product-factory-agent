@@ -52,25 +52,23 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def exclusive_create_json(path: Path, payload: dict[str, Any]) -> bool:
-    """Create a JSON document once, returning False when its path already exists."""
+    """Publish a complete JSON document once without replacing an existing one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    except FileExistsError:
-        return False
-
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-
-    _fsync_parent_directory(path)
-    return True
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        _fsync_parent_directory(path)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:

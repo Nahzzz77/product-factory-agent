@@ -1,3 +1,4 @@
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from product_factory.contracts.models import (
     WorkflowState,
 )
 from product_factory.errors import FactoryError
+from product_factory.storage import files
 from product_factory.storage.repository import ProjectRepository
 
 
@@ -86,17 +88,18 @@ def test_concurrent_evidence_creation_preserves_only_the_winner(
     repo = ProjectRepository(tmp_path)
     manifests = [make_evidence("b" * 64), make_evidence("c" * 64)]
     target = repo.evidence_path("stage-01", "evidence-01")
-    original_exists = Path.exists
-    both_checked_for_absence = threading.Barrier(2)
+    original_open = files.os.open
     start_together = threading.Barrier(2)
+    loser_reported = threading.Event()
+    release_final_writer = threading.Event()
 
-    def synchronized_exists(path: Path) -> bool:
-        exists = original_exists(path)
-        if path == target and not exists:
-            both_checked_for_absence.wait(timeout=5)
-        return exists
+    def delay_final_file_write(path: str | Path, flags: int, mode: int = 0o777) -> int:
+        descriptor = original_open(path, flags, mode)
+        if Path(path) == target and flags & os.O_EXCL:
+            release_final_writer.wait(timeout=5)
+        return descriptor
 
-    monkeypatch.setattr(Path, "exists", synchronized_exists)
+    monkeypatch.setattr(files.os, "open", delay_final_file_write)
 
     def contender(record: EvidenceManifest) -> tuple[str, EvidenceManifest]:
         start_together.wait(timeout=5)
@@ -104,14 +107,26 @@ def test_concurrent_evidence_creation_preserves_only_the_winner(
             repo.save_evidence(record)
         except FactoryError as exc:
             assert exc.code == "evidence_exists"
+            loser_reported.set()
             return "error", record
         return "success", record
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = list(executor.map(contender, manifests))
+    def read_after_loser_observes_existing_evidence() -> EvidenceManifest:
+        assert loser_reported.wait(timeout=5)
+        try:
+            return repo.load_evidence("stage-01", "evidence-01")
+        finally:
+            release_final_writer.set()
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        contenders = [executor.submit(contender, record) for record in manifests]
+        reader = executor.submit(read_after_loser_observes_existing_evidence)
+        outcomes = [future.result() for future in contenders]
+        observed = reader.result()
 
     winners = [record for status, record in outcomes if status == "success"]
     losers = [record for status, record in outcomes if status == "error"]
     assert len(winners) == 1
     assert len(losers) == 1
+    assert observed == winners[0]
     assert repo.load_evidence("stage-01", "evidence-01") == winners[0]
