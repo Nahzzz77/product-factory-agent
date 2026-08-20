@@ -109,7 +109,9 @@ def test_initialize_copies_baseline_and_creates_protocol_files(tmp_path: Path) -
     assert (target / ".product-factory/events.jsonl").read_text(encoding="utf-8") == ""
 
 
-def test_initialize_rejects_a_non_empty_target(tmp_path: Path) -> None:
+def test_initialize_rejects_a_non_empty_target_without_reading_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     target = tmp_path / "new-product"
     target.mkdir()
     (target / "existing.txt").write_text("do not overwrite", encoding="utf-8")
@@ -118,6 +120,14 @@ def test_initialize_rejects_a_non_empty_target(tmp_path: Path) -> None:
     intake = tmp_path / "intake.yaml"
     write_intake(intake)
 
+    def sources_must_not_be_read(self: Path, *args: object, **kwargs: object) -> bytes:
+        if self in {prd, intake}:
+            raise AssertionError("non-empty target must win before source reads")
+        return original_read_bytes(self, *args, **kwargs)
+
+    original_read_bytes = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", sources_must_not_be_read)
+
     with pytest.raises(FactoryError) as caught:
         initialize_project(
             target, "demo-web", "Demo Web", prd, intake, [("stage-01", "Core", False)], Path.cwd()
@@ -125,6 +135,81 @@ def test_initialize_rejects_a_non_empty_target(tmp_path: Path) -> None:
 
     assert caught.value.code == "project_exists"
     assert (target / "existing.txt").read_text(encoding="utf-8") == "do not overwrite"
+
+
+@pytest.mark.parametrize("preexisting_empty_target", [False, True])
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("missing_prd", "prd_unreadable"),
+        ("unreadable_prd", "prd_unreadable"),
+        ("empty_stages", "stage_plan_invalid"),
+        ("invalid_stages", "stage_plan_invalid"),
+        ("missing_handbook", "handbook_invalid"),
+        ("malformed_handbook", "handbook_invalid"),
+        ("missing_constraints", "constraints_unreadable"),
+    ],
+)
+def test_initialize_preflight_failures_do_not_mutate_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting_empty_target: bool,
+    failure: str,
+    expected_code: str,
+) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    target = tmp_path / "new-product"
+    if preexisting_empty_target:
+        target.mkdir()
+    factory_root = Path.cwd()
+    constraints: Path | None = None
+    stages: object = [("stage-01", "Core", False)]
+
+    if failure == "missing_prd":
+        prd = tmp_path / "missing-prd.md"
+    elif failure == "unreadable_prd":
+        original_read_bytes = Path.read_bytes
+
+        def unreadable_prd(self: Path, *args: object, **kwargs: object) -> bytes:
+            if self == prd:
+                raise OSError("permission denied")
+            return original_read_bytes(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_bytes", unreadable_prd)
+    elif failure == "empty_stages":
+        stages = []
+    elif failure == "invalid_stages":
+        stages = [("bad",)]
+    elif failure == "missing_handbook":
+        factory_root = tmp_path / "factory-without-handbooks"
+    elif failure == "malformed_handbook":
+        factory_root = tmp_path / "factory-malformed"
+        manifest = factory_root / "references/handbooks/manifest.yaml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("schema_version: '1.0'\ndocuments: not-a-list\n", encoding="utf-8")
+    elif failure == "missing_constraints":
+        constraints = tmp_path / "missing-constraints.md"
+
+    with pytest.raises(FactoryError) as caught:
+        initialize_project(
+            target,
+            "demo-web",
+            "Demo Web",
+            prd,
+            intake,
+            stages,  # type: ignore[arg-type]
+            factory_root,
+            constraints,
+        )
+
+    assert caught.value.code == expected_code
+    if preexisting_empty_target:
+        assert list(target.iterdir()) == []
+    else:
+        assert not target.exists()
 
 
 def test_initialize_rejects_invalid_intake_before_creating_target(tmp_path: Path) -> None:

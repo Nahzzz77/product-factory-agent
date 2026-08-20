@@ -1,6 +1,7 @@
 """New-project initialization and deterministic PRD intake validation."""
 
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -61,13 +62,18 @@ def initialize_project(
             "使用新的空目录",
         )
 
-    factory_root = factory_root.resolve()
-    resolved_intake = _source_path(intake_source, factory_root)
-    resolved_prd = _source_path(prd_source, factory_root)
-    resolved_constraints = (
-        _source_path(constraints_source, factory_root) if constraints_source is not None else None
+    prepared = _prepare_project(
+        project_id=project_id,
+        name=name,
+        prd_source=prd_source,
+        intake_source=intake_source,
+        stage_specs=stage_specs,
+        factory_root=factory_root.resolve(),
+        constraints_source=constraints_source,
     )
-    intake_content = _read_valid_intake(resolved_intake)
+
+    # No target mutation occurs before every source byte, handbook, protocol model,
+    # and stage item has been successfully read and validated above.
     target.mkdir(parents=True, exist_ok=True)
     for directory in (
         target / "inputs/assets",
@@ -84,45 +90,87 @@ def initialize_project(
     (metadata / "approvals.jsonl").write_bytes(b"")
     (metadata / "events.jsonl").write_bytes(b"")
 
-    prd_digest = copy_baseline(resolved_prd, target / "inputs/PRD.md")
-    _copy_baseline_bytes(intake_content, target / ".product-factory/intake.yaml")
+    _copy_baseline_bytes(prepared.prd_bytes, target / "inputs/PRD.md")
+    _copy_baseline_bytes(prepared.intake_bytes, target / ".product-factory/intake.yaml")
     constraints_path = target / "inputs/constraints.md"
-    if resolved_constraints is None:
-        constraints_path.write_bytes(b"")
-    else:
-        copy_baseline(resolved_constraints, constraints_path)
+    _copy_baseline_bytes(prepared.constraints_bytes, constraints_path)
 
+    repository = ProjectRepository(target)
+    repository.save_project(prepared.project)
+    repository.write_initial_state(prepared.initial_state)
+    return prepared.initial_state
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedProject:
+    intake_bytes: bytes
+    prd_bytes: bytes
+    constraints_bytes: bytes
+    project: ProjectRecord
+    initial_state: StateRecord
+
+
+def _prepare_project(
+    *,
+    project_id: str,
+    name: str,
+    prd_source: Path,
+    intake_source: Path,
+    stage_specs: Iterable[tuple[str, str, bool]],
+    factory_root: Path,
+    constraints_source: Path | None,
+) -> _PreparedProject:
+    """Read and validate every potentially failing initialization input before writes."""
+    resolved_intake = _source_path(intake_source, factory_root)
+    resolved_prd = _source_path(prd_source, factory_root)
+    resolved_constraints = (
+        _source_path(constraints_source, factory_root) if constraints_source is not None else None
+    )
+    intake_bytes = _read_valid_intake(resolved_intake)
+    prd_bytes = _read_source_bytes(resolved_prd, "prd_unreadable", "PRD 基线文件不可读取")
+    constraints_bytes = (
+        b""
+        if resolved_constraints is None
+        else _read_source_bytes(resolved_constraints, "constraints_unreadable", "约束基线文件不可读取")
+    )
     stages = _stage_plan(stage_specs)
     handbooks = _load_handbooks(factory_root)
-    repository = ProjectRepository(target)
-    repository.save_project(
-        ProjectRecord(
+    now = datetime.now(timezone.utc)
+    try:
+        project = ProjectRecord(
             schema_version="1.0",
             project_id=project_id,
             name=name,
-            created_at=datetime.now(timezone.utc),
+            created_at=now,
             factory_version=__version__,
-            prd=PrdReference(path="inputs/PRD.md", sha256=prd_digest),
+            prd=PrdReference(path="inputs/PRD.md", sha256=hashlib.sha256(prd_bytes).hexdigest()),
             constraints_path="inputs/constraints.md",
             handbooks=handbooks,
             stage_plan=stages,
             source_excludes=[],
         )
-    )
-    initial = StateRecord(
-        schema_version="1.0",
-        project_id=project_id,
-        revision=0,
-        workflow_state=WorkflowState.INITIALIZED,
-        current_stage=CurrentStage(
-            id=stages[0].id,
-            sequence=stages[0].sequence,
-            completion_level=CompletionLevel.NONE,
-        ),
-        updated_at=datetime.now(timezone.utc),
-    )
-    repository.write_initial_state(initial)
-    return initial
+        initial = StateRecord(
+            schema_version="1.0",
+            project_id=project_id,
+            revision=0,
+            workflow_state=WorkflowState.INITIALIZED,
+            current_stage=CurrentStage(
+                id=stages[0].id,
+                sequence=stages[0].sequence,
+                completion_level=CompletionLevel.NONE,
+            ),
+            updated_at=now,
+        )
+    except (ValidationError, ValueError, IndexError) as exc:
+        raise FactoryError(
+            "project_definition_invalid",
+            ErrorCategory.INPUT_REQUIRED,
+            "项目定义或阶段计划无效",
+            "init",
+            False,
+            "修正项目 ID、名称或阶段计划后重试",
+        ) from exc
+    return _PreparedProject(intake_bytes, prd_bytes, constraints_bytes, project, initial)
 
 
 def collect_input_errors(repo: ProjectRepository) -> list[str]:
@@ -209,37 +257,88 @@ def _read_valid_intake(path: Path) -> bytes:
     return content
 
 
+def _read_source_bytes(path: Path, code: str, message: str) -> bytes:
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise FactoryError(
+            code,
+            ErrorCategory.INPUT_REQUIRED,
+            message,
+            "init",
+            False,
+            "修正或提供可读的基线文件后重试",
+        ) from exc
+
+
 def _stage_plan(stage_specs: Iterable[tuple[str, str, bool]]) -> list[StagePlanItem]:
-    return [
-        StagePlanItem(
-            id=stage_id,
-            name=name,
-            sequence=sequence,
-            requires_real_model=requires_real_model,
+    try:
+        specs = list(stage_specs)
+        stages = [
+            StagePlanItem(
+                id=stage_id,
+                name=name,
+                sequence=sequence,
+                requires_real_model=requires_real_model,
+            )
+            for sequence, (stage_id, name, requires_real_model) in enumerate(specs, start=1)
+        ]
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise FactoryError(
+            "stage_plan_invalid",
+            ErrorCategory.INPUT_REQUIRED,
+            "阶段计划格式无效",
+            "init",
+            False,
+            "提供至少一个合法阶段",
+        ) from exc
+    if not stages:
+        raise FactoryError(
+            "stage_plan_invalid",
+            ErrorCategory.INPUT_REQUIRED,
+            "阶段计划不能为空",
+            "init",
+            False,
+            "提供至少一个合法阶段",
         )
-        for sequence, (stage_id, name, requires_real_model) in enumerate(stage_specs, start=1)
-    ]
+    return stages
 
 
 def _load_handbooks(factory_root: Path) -> list[HandbookReference]:
     manifest_path = factory_root / "references/handbooks/manifest.yaml"
-    manifest = load_yaml(manifest_path)
-    documents = manifest.get("documents")
-    if not isinstance(documents, list):
-        raise ValueError("handbook manifest documents must be a list")
-    handbooks: list[HandbookReference] = []
-    for document in documents:
-        if not isinstance(document, dict):
-            raise ValueError("handbook manifest entry must be a mapping")
-        relative_path = document["path"]
-        if not isinstance(relative_path, str):
-            raise ValueError("handbook path must be a string")
-        handbooks.append(
-            HandbookReference(
-                title=document["title"],
-                version=document["version"],
-                path=relative_path,
-                sha256=hashlib.sha256((factory_root / relative_path).read_bytes()).hexdigest(),
+    try:
+        manifest = load_yaml(manifest_path)
+        if manifest.get("schema_version") != "1.0":
+            raise ValueError("unsupported handbook manifest schema")
+        documents = manifest.get("documents")
+        if not isinstance(documents, list) or not documents:
+            raise ValueError("handbook manifest documents must be a non-empty list")
+        handbooks: list[HandbookReference] = []
+        for document in documents:
+            if not isinstance(document, dict):
+                raise ValueError("handbook manifest entry must be a mapping")
+            relative_path = document["path"]
+            if not isinstance(relative_path, str):
+                raise ValueError("handbook path must be a string")
+            content = (factory_root / relative_path).read_bytes()
+            digest = hashlib.sha256(content).hexdigest()
+            if document.get("sha256") != digest:
+                raise ValueError("handbook digest mismatch")
+            handbooks.append(
+                HandbookReference(
+                    title=document["title"],
+                    version=document["version"],
+                    path=relative_path,
+                    sha256=digest,
+                )
             )
-        )
+    except (KeyError, OSError, TypeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise FactoryError(
+            "handbook_invalid",
+            ErrorCategory.INPUT_REQUIRED,
+            "技术手册清单或内容无效",
+            "init",
+            False,
+            "修复手册清单及其引用文件后重试",
+        ) from exc
     return handbooks
