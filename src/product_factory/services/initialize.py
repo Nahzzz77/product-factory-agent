@@ -77,6 +77,12 @@ def initialize_project(
         target / "frontend",
     ):
         directory.mkdir(parents=True, exist_ok=True)
+    # Repository construction is deliberately read-only.  Initialize the protocol
+    # directory and its two empty append-only logs explicitly after input validation.
+    metadata = target / ".product-factory"
+    metadata.mkdir(parents=True, exist_ok=True)
+    (metadata / "approvals.jsonl").write_bytes(b"")
+    (metadata / "events.jsonl").write_bytes(b"")
 
     prd_digest = copy_baseline(resolved_prd, target / "inputs/PRD.md")
     _copy_baseline_bytes(intake_content, target / ".product-factory/intake.yaml")

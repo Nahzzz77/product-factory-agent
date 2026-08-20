@@ -251,6 +251,11 @@ def test_approval_retry_reuses_the_single_durable_record_after_state_save_failur
         service.approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 2)
     assert len(ProjectRepository(root).read_approvals()) == 1
 
+    with pytest.raises(FactoryError) as caught:
+        service.approve(APPROVAL_STATEMENT, "other-owner", lock.lock_id, 2)
+    assert caught.value.code == "approval_recovery_required"
+    assert len(ProjectRepository(root).read_approvals()) == 1
+
     approved = service.approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 2)
     approvals = ProjectRepository(root).read_approvals()
     assert approved.revision == 3
@@ -336,3 +341,38 @@ def test_project_identity_mismatch_blocks_mutations_without_audit_writes(tmp_pat
     assert caught.value.code == "project_identity_mismatch"
     assert ProjectRepository(root).read_approvals() == []
     assert [event.event_type for event in ProjectRepository(root).read_events()] == ["inputs_checked"]
+
+
+def test_all_workflow_identity_failures_leave_business_protocol_files_unchanged(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _inputs_checked(root)
+    repo = ProjectRepository(root)
+    state = repo.load_state()
+    repo.save_state(state.model_copy(update={"project_id": "wrong-project", "revision": 2}), 1)
+    (root / "docs/technical-adaptation.md").write_text("v1", encoding="utf-8")
+    lock = _lock(root, 2)
+    business_files = (
+        repo.paths.project,
+        repo.paths.intake,
+        repo.paths.state,
+        repo.paths.approvals,
+        repo.paths.events,
+    )
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in business_files}
+    service = WorkflowService(root)
+
+    operations = (
+        lambda: service.request_approval(
+            GateType.TECHNICAL_ADAPTATION, Path("docs/technical-adaptation.md"), lock.lock_id, 2
+        ),
+        lambda: service.approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 2),
+        lambda: service.start_verification(lock.lock_id, 2),
+        lambda: service.mark_system_verified("evidence-01", lock.lock_id, 2),
+    )
+    for operation in operations:
+        with pytest.raises(FactoryError) as caught:
+            operation()
+        assert caught.value.code == "project_identity_mismatch"
+
+    after = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in business_files}
+    assert after == before

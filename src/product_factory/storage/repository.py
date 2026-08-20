@@ -25,9 +25,6 @@ from product_factory.storage.paths import ProjectPaths
 class ProjectRepository:
     def __init__(self, root: Path):
         self.paths = ProjectPaths(root.resolve())
-        self.paths.metadata.mkdir(parents=True, exist_ok=True)
-        self.paths.approvals.touch(exist_ok=True)
-        self.paths.events.touch(exist_ok=True)
 
     def load_state(self) -> StateRecord:
         return StateRecord.model_validate_json(self.paths.state.read_text(encoding="utf-8"))

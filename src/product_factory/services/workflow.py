@@ -353,7 +353,8 @@ class WorkflowService:
                 require_exact_approval(record, waiting, expected_revision)
             except FactoryError:
                 continue
-            exact.append(record)
+            if record.actor == proposed.actor and record.source == proposed.source:
+                exact.append(record)
         if len(exact) == 1 and len(related) == 1:
             return exact[0]
         if len(exact) > 1 or related:

@@ -65,11 +65,42 @@ def test_save_state_rejects_stale_expected_revision(tmp_path: Path) -> None:
     assert caught.value.code == "revision_conflict"
 
 
-def test_repository_initialization_creates_empty_event_and_approval_logs(tmp_path: Path) -> None:
-    repo = ProjectRepository(tmp_path)
+def test_repository_construction_is_read_only_for_missing_and_existing_paths(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-project"
+    ProjectRepository(missing)
+    assert not missing.exists()
 
-    assert repo.paths.approvals.read_text(encoding="utf-8") == ""
-    assert repo.paths.events.read_text(encoding="utf-8") == ""
+    metadata = tmp_path / "existing/.product-factory"
+    metadata.mkdir(parents=True)
+    approval = metadata / "approvals.jsonl"
+    event = metadata / "events.jsonl"
+    approval.write_text("existing approval\n", encoding="utf-8")
+    event.write_text("existing event\n", encoding="utf-8")
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (approval, event)
+    }
+
+    repo = ProjectRepository(metadata.parent)
+
+    assert repo.paths.approvals == approval
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in (approval, event)
+    } == before
+
+
+def test_missing_log_reads_do_not_create_protocol_files(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    repo = ProjectRepository(root)
+
+    with pytest.raises(FileNotFoundError):
+        repo.read_approvals()
+    with pytest.raises(FileNotFoundError):
+        repo.read_events()
+
+    assert not repo.paths.metadata.exists()
 
 
 def test_save_state_rejects_a_non_sequential_next_revision(tmp_path: Path) -> None:
