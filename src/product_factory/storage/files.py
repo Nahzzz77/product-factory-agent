@@ -78,12 +78,33 @@ def atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    """Append one complete JSONL record, or preserve the complete previous file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(line)
-        handle.flush()
-        os.fsync(handle.fileno())
+    previous = path.read_bytes() if path.exists() else b""
+    line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        _write_all(descriptor, previous + line)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        _fsync_parent_directory(path)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    remaining = memoryview(content)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written == 0:
+            raise OSError("could not write complete file")
+        remaining = remaining[written:]
 
 
 def load_json(path: Path) -> dict[str, Any]:

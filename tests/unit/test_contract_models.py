@@ -55,3 +55,13 @@ def test_state_enum_values_match_protocol() -> None:
         updated_at=datetime.now(timezone.utc),
     )
     assert state.workflow_state.value == "initialized"
+
+
+@pytest.mark.parametrize("reason", [None, "", "   "])
+def test_not_applicable_requirement_rejects_blank_reason(reason: str | None) -> None:
+    with pytest.raises(ValidationError):
+        RequirementDeclaration(
+            status=RequirementStatus.NOT_APPLICABLE,
+            source="产品负责人确认",
+            reason=reason,
+        )

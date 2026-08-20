@@ -115,6 +115,17 @@ class LockManager:
             )
         return record
 
+    @contextmanager
+    def mutation(self, lock_id: str, expected_revision: int) -> Iterator[LockRecord]:
+        """Fence a complete business-state mutation with the canonical lease mutex.
+
+        The lock identity and bound revision are checked only after the SQLite
+        mutex is held, so lease lifecycle operations cannot interleave with the
+        caller's state snapshot, write, or audit append.
+        """
+        with self._mutation_mutex():
+            yield self.require(lock_id, expected_revision)
+
     def heartbeat(self, lock_id: str, lease: timedelta) -> LockRecord:
         self._require_positive_lease(lease)
         with self._mutation_mutex():

@@ -5,10 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+import yaml
+from pydantic import ValidationError
+
 from product_factory.contracts.models import (
     CompletionLevel,
     CurrentStage,
     HandbookReference,
+    IntakeRecord,
     ProjectRecord,
     PrdReference,
     RequirementStatus,
@@ -60,6 +64,7 @@ def initialize_project(
     resolved_constraints = (
         _source_path(constraints_source, factory_root) if constraints_source is not None else None
     )
+    _require_valid_intake(resolved_intake)
     target.mkdir(parents=True, exist_ok=True)
     for directory in (
         target / "inputs/assets",
@@ -137,42 +142,57 @@ def collect_input_errors(repo: ProjectRepository) -> list[str]:
 def check_inputs(root: Path, lock_id: str, expected_revision: int = 0) -> StateRecord:
     """Validate declared inputs and atomically advance an initialized project once."""
     root = root.resolve()
-    LockManager(root).require(lock_id, expected_revision)
-    repo = ProjectRepository(root)
-    current = repo.load_state()
-    if current.revision != expected_revision:
-        raise FactoryError(
-            "revision_conflict",
-            ErrorCategory.ENVIRONMENT_BLOCKED,
-            "状态已被其他会话修改",
-            "check_inputs",
-            True,
-            "重新运行 status 或 resume",
-            {"expected": expected_revision, "actual": current.revision},
+    manager = LockManager(root)
+    with manager.mutation(lock_id, expected_revision):
+        repo = ProjectRepository(root)
+        current = repo.load_state()
+        if current.revision != expected_revision:
+            raise FactoryError(
+                "revision_conflict",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "状态已被其他会话修改",
+                "check_inputs",
+                True,
+                "重新运行 status 或 resume",
+                {"expected": expected_revision, "actual": current.revision},
+            )
+        errors = collect_input_errors(repo)
+        if errors:
+            raise FactoryError(
+                errors[0],
+                ErrorCategory.INPUT_REQUIRED,
+                "项目输入尚未满足最低要求",
+                "check_inputs",
+                False,
+                "补齐 PRD 或 intake 声明后重试",
+                {"errors": errors},
+            )
+        next_state = current.model_copy(
+            update={
+                "revision": expected_revision + 1,
+                "workflow_state": WorkflowState.INPUTS_CHECKED,
+                "updated_at": datetime.now(timezone.utc),
+            }
         )
-    errors = collect_input_errors(repo)
-    if errors:
-        raise FactoryError(
-            errors[0],
-            ErrorCategory.INPUT_REQUIRED,
-            "项目输入尚未满足最低要求",
-            "check_inputs",
-            False,
-            "补齐 PRD 或 intake 声明后重试",
-            {"errors": errors},
-        )
-    next_state = current.model_copy(
-        update={
-            "revision": expected_revision + 1,
-            "workflow_state": WorkflowState.INPUTS_CHECKED,
-            "updated_at": datetime.now(timezone.utc),
-        }
-    )
-    return commit_state_change(repo, current, next_state, "inputs_checked", {"errors": []})
+        return commit_state_change(repo, current, next_state, "inputs_checked", {"errors": []})
 
 
 def _source_path(source: Path, factory_root: Path) -> Path:
     return source.resolve() if source.is_absolute() else (factory_root / source).resolve()
+
+
+def _require_valid_intake(path: Path) -> None:
+    try:
+        IntakeRecord.model_validate(load_yaml(path))
+    except (OSError, ValidationError, ValueError, yaml.YAMLError) as exc:
+        raise FactoryError(
+            "intake_invalid",
+            ErrorCategory.INPUT_REQUIRED,
+            "intake 声明无效或无法读取",
+            "init",
+            False,
+            "修正 intake.yaml 的七类输入声明后重试",
+        ) from exc
 
 
 def _stage_plan(stage_specs: Iterable[tuple[str, str, bool]]) -> list[StagePlanItem]:

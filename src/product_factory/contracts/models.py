@@ -49,7 +49,9 @@ class RequirementDeclaration(StrictModel):
 
     @model_validator(mode="after")
     def require_reason_for_not_applicable(self):
-        if self.status is RequirementStatus.NOT_APPLICABLE and not self.reason:
+        if self.status is RequirementStatus.NOT_APPLICABLE and (
+            self.reason is None or not self.reason.strip()
+        ):
             raise ValueError("not_applicable requires reason")
         return self
 
