@@ -60,6 +60,8 @@ class _TakeoverGuard:
 @dataclass(frozen=True, slots=True)
 class _TakeoverRecovery:
     recovery_id: str
+    generation: int
+    state: str
     owner: LockOwner
     acquired_at: datetime
     expires_at: datetime
@@ -68,6 +70,8 @@ class _TakeoverRecovery:
     def payload(self) -> dict[str, Any]:
         return {
             "recovery_id": self.recovery_id,
+            "generation": self.generation,
+            "state": self.state,
             "owner": self.owner.model_dump(mode="json"),
             "acquired_at": self.acquired_at.isoformat(),
             "expires_at": self.expires_at.isoformat(),
@@ -82,7 +86,7 @@ class LockManager:
         self.paths = ProjectPaths(root.resolve())
         self.path = self.paths.lock
         self.takeover_guard_path = self.path.with_name("execution-lock.takeover-guard.json")
-        self.takeover_recovery_path = self.path.with_name("execution-lock.takeover-recovery.json")
+        self.takeover_recovery_dir = self.path.with_name("execution-lock.takeover-recovery")
         self.now = now_fn or (lambda: datetime.now(timezone.utc))
 
     def acquire(self, owner: LockOwner, state_revision: int, lease: timedelta) -> LockRecord:
@@ -327,13 +331,9 @@ class LockManager:
         self.takeover_guard_path.parent.mkdir(parents=True, exist_ok=True)
         while True:
             now = self._now()
-            recovery = self._read_recovery()
-            if recovery is not None:
-                if recovery.expires_at > now:
-                    raise self._takeover_in_progress()
-                self._recover_abandoned_recovery(recovery)
-                continue
             guard = _TakeoverGuard(uuid.uuid4().hex, owner, now, now + _GUARD_LEASE)
+            if self._has_active_recovery(now):
+                raise self._takeover_in_progress()
             if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
                 return guard
 
@@ -345,14 +345,18 @@ class LockManager:
 
             recovery = _TakeoverRecovery(
                 recovery_id=uuid.uuid4().hex,
+                generation=self._next_recovery_generation(existing.guard_id),
+                state="active",
                 owner=owner,
                 acquired_at=now,
                 expires_at=now + _GUARD_LEASE,
                 guard=existing,
             )
-            if not self._exclusive_create_payload(self.takeover_recovery_path, recovery.payload()):
+            if not self._write_recovery_exclusive(recovery):
                 raise self._takeover_in_progress()
             try:
+                if not self._is_recovery_owner(recovery):
+                    continue
                 confirmed = self._read_guard()
                 if confirmed is None:
                     continue
@@ -364,10 +368,12 @@ class LockManager:
                     continue
                 self.takeover_guard_path.unlink()
                 _fsync_parent_directory(self.takeover_guard_path)
+                self._retire_recovery_claim(recovery)
                 if self._exclusive_create_payload(self.takeover_guard_path, guard.payload()):
                     return guard
             finally:
-                self._release_recovery(recovery)
+                if self._now() < recovery.expires_at:
+                    self._retire_recovery_claim(recovery)
 
     def _release_guard(self, guard: _TakeoverGuard) -> None:
         # Once its own lease has elapsed, this caller may no longer remove the
@@ -399,20 +405,31 @@ class LockManager:
                 "检查并移除损坏的接管保护文件",
             ) from exc
 
-    def _read_recovery(self) -> _TakeoverRecovery | None:
+    def _read_recovery(self, recovery: _TakeoverRecovery) -> _TakeoverRecovery | None:
+        return self._read_recovery_path(self._recovery_claim_path(recovery))
+
+    def _read_recovery_path(self, path: Path) -> _TakeoverRecovery | None:
         try:
-            payload = json.loads(self.takeover_recovery_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("recovery must be a JSON object")
             recovery_id = payload["recovery_id"]
             if not isinstance(recovery_id, str) or not recovery_id:
                 raise ValueError("recovery_id must be a non-empty string")
+            generation = payload["generation"]
+            if not isinstance(generation, int) or generation < 0:
+                raise ValueError("generation must be a non-negative integer")
+            state = payload["state"]
+            if state not in {"active", "retired"}:
+                raise ValueError("recovery state is invalid")
             acquired_at = datetime.fromisoformat(payload["acquired_at"])
             expires_at = datetime.fromisoformat(payload["expires_at"])
             if acquired_at.tzinfo is None or expires_at.tzinfo is None:
                 raise ValueError("recovery timestamps must be timezone-aware")
             return _TakeoverRecovery(
                 recovery_id=recovery_id,
+                generation=generation,
+                state=state,
                 owner=LockOwner.model_validate(payload["owner"]),
                 acquired_at=acquired_at,
                 expires_at=expires_at,
@@ -447,24 +464,63 @@ class LockManager:
             expires_at=expires_at,
         )
 
-    def _recover_abandoned_recovery(self, recovery: _TakeoverRecovery) -> None:
-        """Restore the exact stale guard after a crashed recovery owner."""
-        current = self._read_guard()
-        if current is None:
-            self._exclusive_create_payload(self.takeover_guard_path, recovery.guard.payload())
-        self._release_recovery(recovery, allow_expired=True)
+    def _recovery_claim_path(self, recovery: _TakeoverRecovery) -> Path:
+        return self.takeover_recovery_dir / f"{recovery.guard.guard_id}.{recovery.generation:020d}.json"
 
-    def _release_recovery(self, recovery: _TakeoverRecovery, *, allow_expired: bool = False) -> None:
-        if not allow_expired and self._now() >= recovery.expires_at:
+    def _write_recovery(self, recovery: _TakeoverRecovery) -> None:
+        atomic_write_json(self._recovery_claim_path(recovery), recovery.payload())
+
+    def _write_recovery_exclusive(self, recovery: _TakeoverRecovery) -> bool:
+        self.takeover_recovery_dir.mkdir(parents=True, exist_ok=True)
+        return self._exclusive_create_payload(self._recovery_claim_path(recovery), recovery.payload())
+
+    def _retire_recovery_claim(self, recovery: _TakeoverRecovery) -> None:
+        current = self._read_recovery(recovery)
+        if current is None or current.recovery_id != recovery.recovery_id or current.state == "retired":
             return
-        current = self._read_recovery()
-        if current is None or current.recovery_id != recovery.recovery_id:
-            return
-        try:
-            self.takeover_recovery_path.unlink()
-            _fsync_parent_directory(self.takeover_recovery_path)
-        except FileNotFoundError:
-            return
+        self._write_recovery(
+            _TakeoverRecovery(
+                recovery_id=recovery.recovery_id,
+                generation=recovery.generation,
+                state="retired",
+                owner=recovery.owner,
+                acquired_at=recovery.acquired_at,
+                expires_at=recovery.expires_at,
+                guard=recovery.guard,
+            )
+        )
+
+    def _recoveries_for_guard(self, guard_id: str) -> list[_TakeoverRecovery]:
+        if not self.takeover_recovery_dir.exists():
+            return []
+        recoveries: list[_TakeoverRecovery] = []
+        for path in self.takeover_recovery_dir.glob(f"{guard_id}.*.json"):
+            recovery = self._read_recovery_path(path)
+            if recovery is not None and recovery.guard.guard_id == guard_id:
+                recoveries.append(recovery)
+        return recoveries
+
+    def _next_recovery_generation(self, guard_id: str) -> int:
+        recoveries = self._recoveries_for_guard(guard_id)
+        return max((recovery.generation for recovery in recoveries), default=-1) + 1
+
+    def _is_recovery_owner(self, recovery: _TakeoverRecovery) -> bool:
+        if self._now() >= recovery.expires_at:
+            return False
+        current = self._read_recovery(recovery)
+        if current is None or current.recovery_id != recovery.recovery_id or current.state != "active":
+            return False
+        latest = max(self._recoveries_for_guard(recovery.guard.guard_id), key=lambda item: item.generation)
+        return latest.recovery_id == recovery.recovery_id and latest.state == "active"
+
+    def _has_active_recovery(self, now: datetime) -> bool:
+        if not self.takeover_recovery_dir.exists():
+            return False
+        for path in self.takeover_recovery_dir.glob("*.json"):
+            recovery = self._read_recovery_path(path)
+            if recovery is not None and recovery.state == "active" and recovery.expires_at > now:
+                return True
+        return False
 
     def _takeover_in_progress(self) -> FactoryError:
         return FactoryError(
@@ -484,11 +540,10 @@ class LockManager:
         content = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
             "utf-8"
         )
+        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        descriptor: int | None = None
         try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            return False
-        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             remaining = memoryview(content)
             while remaining:
                 written = os.write(descriptor, remaining)
@@ -496,16 +551,18 @@ class LockManager:
                     raise OSError("could not write lock file")
                 remaining = remaining[written:]
             os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                return False
             _fsync_parent_directory(path)
             return True
-        except BaseException:
-            os.close(descriptor)
-            descriptor = -1
-            path.unlink(missing_ok=True)
-            raise
         finally:
-            if descriptor != -1:
+            if descriptor is not None:
                 os.close(descriptor)
+            temporary.unlink(missing_ok=True)
 
     def _guard_owner(self, lock_id: str) -> LockOwner:
         return LockOwner(

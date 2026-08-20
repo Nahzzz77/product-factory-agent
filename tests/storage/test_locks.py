@@ -259,3 +259,95 @@ def test_takeover_rejects_same_id_with_changed_expiry_inside_guard(
 
     assert caught.value.code == "lock_changed"
     assert original_status().lock_id == old.lock_id
+
+
+def test_retiring_old_recovery_claim_cannot_delete_successor_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    manager = LockManager(tmp_path, now_fn=lambda: now)
+    guard = locks._TakeoverGuard("stale", owner("stale"), now - timedelta(minutes=1), now)
+    old = locks._TakeoverRecovery(
+        recovery_id="old",
+        generation=0,
+        state="active",
+        owner=owner("old"),
+        acquired_at=now,
+        expires_at=now + timedelta(minutes=1),
+        guard=guard,
+    )
+    successor = locks._TakeoverRecovery(
+        recovery_id="successor",
+        generation=1,
+        state="active",
+        owner=owner("successor"),
+        acquired_at=now,
+        expires_at=now + timedelta(minutes=1),
+        guard=guard,
+    )
+    manager._write_recovery(old)
+    old_path = manager._recovery_claim_path(old)
+    old_is_paused = Event()
+    allow_old_retirement = Event()
+    original_atomic_write = locks.atomic_write_json
+
+    def pause_old_retirement(path: Path, payload: dict) -> None:
+        if path == old_path and payload["state"] == "retired":
+            old_is_paused.set()
+            assert allow_old_retirement.wait(timeout=5)
+        original_atomic_write(path, payload)
+
+    monkeypatch.setattr(locks, "atomic_write_json", pause_old_retirement)
+    retiring = Thread(target=manager._retire_recovery_claim, args=(old,))
+    retiring.start()
+    assert old_is_paused.wait(timeout=5)
+
+    manager._write_recovery(successor)
+    allow_old_retirement.set()
+    retiring.join(timeout=5)
+
+    assert not retiring.is_alive()
+    assert manager._read_recovery(successor) == successor
+
+
+def test_exclusive_guard_publication_never_exposes_partial_json_or_corrupts_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    manager = LockManager(tmp_path, now_fn=lambda: now)
+    guard = locks._TakeoverGuard("guard", owner("writer"), now, now + timedelta(minutes=1))
+    winner = locks._TakeoverGuard("winner", owner("winner"), now, now + timedelta(minutes=1))
+    partial_write_completed = Event()
+    allow_writer_to_finish = Event()
+    original_write = locks.os.write
+    writes = 0
+    outcome: list[bool] = []
+
+    def pause_after_partial_write(descriptor: int, content: bytes | memoryview) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            midpoint = max(1, len(content) // 2)
+            written = original_write(descriptor, content[:midpoint])
+            partial_write_completed.set()
+            assert allow_writer_to_finish.wait(timeout=5)
+            return written
+        return original_write(descriptor, content)
+
+    monkeypatch.setattr(locks.os, "write", pause_after_partial_write)
+    writer = Thread(
+        target=lambda: outcome.append(manager._exclusive_create_payload(manager.takeover_guard_path, guard.payload()))
+    )
+    writer.start()
+    assert partial_write_completed.wait(timeout=5)
+
+    assert manager._read_guard() is None
+    assert manager._exclusive_create_payload(manager.takeover_guard_path, winner.payload())
+    assert manager._read_guard() == winner
+
+    allow_writer_to_finish.set()
+    writer.join(timeout=5)
+    assert not writer.is_alive()
+    assert outcome == [False]
+    assert manager._read_guard() == winner
+    assert list(manager.paths.metadata.glob("*.tmp")) == []
