@@ -140,6 +140,7 @@ new-product/
 │   └── assets/
 ├── .product-factory/
 │   ├── project.yaml
+│   ├── intake.yaml
 │   ├── state.json
 │   ├── approvals.jsonl
 │   ├── events.jsonl
@@ -189,6 +190,19 @@ new-product/
 - `updated_at`
 
 `revision` 每次成功修改加一。写操作必须带入读取时的预期修订号；修订不一致时返回冲突，不覆盖较新的状态。
+
+### 7.2.1 `intake.yaml`
+
+保存输入完整性声明，避免脚本猜测 Markdown 的业务语义：
+
+- `schema_version`
+- `project_id`
+- `prd_confirmed`
+- `confirmed_by`
+- `confirmed_at`
+- `requirements` 中七类最低 PRD 信息的 `status` 与 `source`
+
+七类信息对应目标用户与核心任务、输入过程与产物、用户主流程与人工确认点、范围与优先级、效果验收标准、模型费用平台约束、数据隐私性能部署要求。`status` 只能为 `present`、`missing` 或 `not_applicable`；`not_applicable` 必须提供原因。`check-inputs` 同时校验实际文件、PRD 摘要和本声明，不能只相信布尔值，也不能用关键词匹配代替产品负责人确认。
 
 ### 7.3 `approvals.jsonl`
 
@@ -252,6 +266,8 @@ new-product/
 源码摘要使用排序后的相对路径和文件内容计算 SHA-256，排除 `.git/`、整个 `.product-factory/` 流程目录、缓存、构建产物、密钥文件及项目配置中的额外排除项。流程状态、审批和证据通过各自的修订号与引用关系校验，不能参与源码摘要，否则正常状态更新会让证据立即过期。摘要只保存哈希值，不复制源码或敏感内容。
 
 证据的阶段 ID、PRD 摘要、工厂版本或源码摘要与当前项目不一致时，证据自动过期。过期证据不能满足阶段门禁。
+
+证据保存到 `.product-factory/evidence/<stage-id>/<evidence-id>/manifest.json`。新证据使用新的 `evidence_id` 和目录，不覆盖旧证据；`state.last_valid_evidence_id` 指向当前有效证据。
 
 ## 8. 状态机
 
