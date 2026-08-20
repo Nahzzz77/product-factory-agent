@@ -7,12 +7,14 @@ import os
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from product_factory.contracts.models import (
     ApprovalRecord,
     CompletionLevel,
     GateType,
+    ProjectRecord,
     StateRecord,
     WaitingOn,
     WorkflowState,
@@ -25,12 +27,18 @@ from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
 
+EvidenceCurrentValidator = Callable[[ProjectRepository, ProjectRecord, StateRecord, str], bool]
+
+
 class WorkflowService:
     """Apply every mutable workflow operation while holding one lease mutex."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, evidence_current: EvidenceCurrentValidator | None = None):
         self.root = root.resolve()
         self.locks = LockManager(self.root)
+        # Task 8 injects the real digest-and-manifest verifier.  Safe by default:
+        # this layer never turns an evidence ID into a human gate on its own.
+        self.evidence_current = evidence_current
 
     def request_approval(
         self,
@@ -42,7 +50,7 @@ class WorkflowService:
         """Create a scope-bound approval request for the current workflow gate."""
         with self.locks.mutation(lock_id, expected_revision):
             repo = ProjectRepository(self.root)
-            current = self._current(repo, expected_revision, "request_approval")
+            project, current = self._context(repo, expected_revision, "request_approval")
             self._require_no_waiting(current, "request_approval")
             if gate is GateType.TECHNICAL_ADAPTATION:
                 scope = self._adaptation_scope(artifact)
@@ -69,6 +77,8 @@ class WorkflowService:
                 has_approval=False,
                 has_valid_evidence=has_evidence,
             )
+            if gate is GateType.STAGE_ACCEPTANCE:
+                self._require_current_evidence(repo, project, current, "request_approval")
             waiting = WaitingOn(
                 type="approval",
                 request_id=str(uuid4()),
@@ -102,16 +112,16 @@ class WorkflowService:
                     category=ErrorCategory.APPROVAL_REQUIRED,
                 )
             repo = ProjectRepository(self.root)
-            current = self._current(repo, expected_revision, "approve")
+            project, current = self._context(repo, expected_revision, "approve")
             waiting = current.waiting_on
             if waiting is None:
                 raise self._error(
                     "approval_not_pending", "当前没有待消费的审批", "approve",
                     category=ErrorCategory.APPROVAL_REQUIRED,
                 )
-            self._require_scope_unchanged(current, waiting)
+            self._require_scope_unchanged(repo, project, current, waiting)
             event_id = str(uuid4())
-            approval = ApprovalRecord(
+            proposed = ApprovalRecord(
                 schema_version="1.0",
                 approval_id=str(uuid4()),
                 request_id=waiting.request_id,
@@ -124,7 +134,7 @@ class WorkflowService:
                 created_at=datetime.now(timezone.utc),
                 consumed_by_revision=expected_revision + 1,
             )
-            require_exact_approval(approval, waiting, expected_revision)
+            approval = self._recover_or_prepare_approval(repo, proposed, waiting, expected_revision)
             target = {
                 GateType.TECHNICAL_ADAPTATION: WorkflowState.STAGE_DEVELOPMENT,
                 GateType.STAGE_ACCEPTANCE: WorkflowState.NEXT_STAGE_OR_FRONTEND,
@@ -143,7 +153,8 @@ class WorkflowService:
             )
             # The approval is intentionally durable before the state transition.  If the
             # subsequent state write fails, the record remains an auditable recovery fact.
-            repo.append_approval(approval)
+            if approval is proposed:
+                repo.append_approval(approval)
             next_state = current.model_copy(
                 update={
                     "revision": expected_revision + 1,
@@ -173,7 +184,7 @@ class WorkflowService:
         """Record completed implementation before evidence is authored and validated."""
         with self.locks.mutation(lock_id, expected_revision):
             repo = ProjectRepository(self.root)
-            current = self._current(repo, expected_revision, "start_verification")
+            _project, current = self._context(repo, expected_revision, "start_verification")
             self._require_no_waiting(current, "start_verification")
             require_transition(
                 current.workflow_state,
@@ -202,7 +213,7 @@ class WorkflowService:
         """Internal Task 8 entry point that commits an already-validated evidence ID."""
         with self.locks.mutation(lock_id, expected_revision):
             repo = ProjectRepository(self.root)
-            current = self._current(repo, expected_revision, "mark_system_verified")
+            _project, current = self._context(repo, expected_revision, "mark_system_verified")
             self._require_no_waiting(current, "mark_system_verified")
             if (
                 current.workflow_state is not WorkflowState.SYSTEM_VERIFICATION
@@ -229,10 +240,20 @@ class WorkflowService:
                 {"stage_id": current.current_stage.id, "evidence_id": evidence_id},
             )
 
-    def _current(
+    def _context(
         self, repo: ProjectRepository, expected_revision: int, step: str
-    ) -> StateRecord:
+    ) -> tuple[ProjectRecord, StateRecord]:
+        project = repo.load_project()
         current = repo.load_state()
+        if current.project_id != project.project_id:
+            raise FactoryError(
+                "project_identity_mismatch",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "项目状态与项目元数据的标识不一致",
+                step,
+                False,
+                "修复项目元数据后重试",
+            )
         if current.revision != expected_revision:
             raise FactoryError(
                 "revision_conflict",
@@ -243,7 +264,7 @@ class WorkflowService:
                 "重新运行 status 或 resume",
                 {"expected": expected_revision, "actual": current.revision},
             )
-        return current
+        return project, current
 
     @staticmethod
     def _require_no_waiting(current: StateRecord, step: str) -> None:
@@ -252,23 +273,21 @@ class WorkflowService:
                 "approval_pending", "当前审批尚未完成", step, category=ErrorCategory.APPROVAL_REQUIRED
             )
 
-    def _adaptation_scope(self, artifact: Path | None) -> dict[str, str]:
+    def _adaptation_scope(self, artifact: Path | None, step: str = "request_approval") -> dict[str, str]:
         if artifact is None:
-            raise self._error("approval_artifact_required", "技术方案审批需要工件", "request_approval")
-        path = self._safe_artifact_path(artifact, "request_approval")
-        try:
-            content = path.read_bytes()
-        except OSError as exc:
-            raise self._error("approval_artifact_invalid", "审批工件不可读取", "request_approval") from exc
+            raise self._error("approval_artifact_required", "技术方案审批需要工件", step)
+        relative, content = self._artifact_snapshot(artifact, step)
         return {
-            "artifact_path": path.relative_to(self.root).as_posix(),
+            "artifact_path": relative,
             "artifact_sha256": hashlib.sha256(content).hexdigest(),
         }
 
-    def _require_scope_unchanged(self, current: StateRecord, waiting: WaitingOn) -> None:
+    def _require_scope_unchanged(
+        self, repo: ProjectRepository, project: ProjectRecord, current: StateRecord, waiting: WaitingOn
+    ) -> None:
         if waiting.gate_type is GateType.TECHNICAL_ADAPTATION:
             try:
-                actual = self._adaptation_scope(Path(str(waiting.scope["artifact_path"])))
+                actual = self._adaptation_scope(Path(str(waiting.scope["artifact_path"])), "approve")
             except (KeyError, TypeError, FactoryError) as exc:
                 raise self._error(
                     "approval_scope_changed", "审批工件范围已变化", "approve",
@@ -279,37 +298,152 @@ class WorkflowService:
                     "approval_scope_changed", "审批工件范围已变化", "approve",
                     category=ErrorCategory.APPROVAL_REQUIRED,
                 )
-        elif waiting.scope != {
-            "stage_id": current.current_stage.id,
-            "evidence_id": current.last_valid_evidence_id,
-        }:
+        else:
+            if waiting.scope != {
+                "stage_id": current.current_stage.id,
+                "evidence_id": current.last_valid_evidence_id,
+            }:
+                raise self._error(
+                    "approval_scope_changed", "审批证据范围已变化", "approve",
+                    category=ErrorCategory.APPROVAL_REQUIRED,
+                )
+            self._require_current_evidence(repo, project, current, "approve")
+
+    def _require_current_evidence(
+        self, repo: ProjectRepository, project: ProjectRecord, current: StateRecord, step: str
+    ) -> None:
+        evidence_id = current.last_valid_evidence_id
+        if evidence_id is None:
             raise self._error(
-                "approval_scope_changed", "审批证据范围已变化", "approve",
-                category=ErrorCategory.APPROVAL_REQUIRED,
+                "evidence_invalid", "缺少当前有效验证证据", step,
+                category=ErrorCategory.IMPLEMENTATION_FAILED,
+            )
+        if self.evidence_current is None:
+            raise self._error(
+                "evidence_validation_required", "未配置证据当前性校验器", step,
+                category=ErrorCategory.IMPLEMENTATION_FAILED,
+            )
+        try:
+            valid = self.evidence_current(repo, project, current, evidence_id)
+        except FactoryError:
+            raise
+        except Exception as exc:
+            raise self._error(
+                "evidence_invalid", "证据当前性校验失败", step,
+                category=ErrorCategory.IMPLEMENTATION_FAILED,
+            ) from exc
+        if valid is not True:
+            raise self._error(
+                "evidence_invalid", "证据已不再反映当前项目事实", step,
+                category=ErrorCategory.IMPLEMENTATION_FAILED,
             )
 
-    def _safe_artifact_path(self, artifact: Path, step: str) -> Path:
+    def _recover_or_prepare_approval(
+        self,
+        repo: ProjectRepository,
+        proposed: ApprovalRecord,
+        waiting: WaitingOn,
+        expected_revision: int,
+    ) -> ApprovalRecord:
+        """Reuse one durable approval after a state-save crash, never append a duplicate."""
+        related = [record for record in repo.read_approvals() if record.request_id == waiting.request_id]
+        exact: list[ApprovalRecord] = []
+        for record in related:
+            try:
+                require_exact_approval(record, waiting, expected_revision)
+            except FactoryError:
+                continue
+            exact.append(record)
+        if len(exact) == 1 and len(related) == 1:
+            return exact[0]
+        if len(exact) > 1 or related:
+            raise self._error(
+                "approval_recovery_required", "发现冲突的审批恢复记录", "approve",
+                category=ErrorCategory.ENVIRONMENT_BLOCKED,
+            )
+        require_exact_approval(proposed, waiting, expected_revision)
+        return proposed
+
+    def _artifact_snapshot(self, artifact: Path, step: str) -> tuple[str, bytes]:
         supplied = artifact if artifact.is_absolute() else self.root / artifact
         try:
             relative = supplied.relative_to(self.root)
         except ValueError as exc:
             raise self._error("approval_artifact_invalid", "审批工件必须位于项目目录内", step) from exc
-        if any(part in {"", ".", ".."} for part in relative.parts):
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
             raise self._error("approval_artifact_invalid", "审批工件路径无效", step)
-        cursor = self.root
-        for part in relative.parts:
-            cursor /= part
-            if cursor.is_symlink():
-                raise self._error("approval_artifact_invalid", "审批工件不能是符号链接", step)
+        if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
+            return self._posix_artifact_snapshot(relative, step)
+        return self._windows_artifact_snapshot(supplied, relative, step)
+
+    def _posix_artifact_snapshot(self, relative: Path, step: str) -> tuple[str, bytes]:
+        """Open each component beneath the root, retaining the exact verified file descriptor."""
+        directory_fd: int | None = None
+        file_fd: int | None = None
         try:
+            directory_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            nofollow = os.O_NOFOLLOW
+            for part in relative.parts[:-1]:
+                next_fd = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=directory_fd
+                )
+                os.close(directory_fd)
+                directory_fd = next_fd
+            file_fd = os.open(relative.parts[-1], os.O_RDONLY | nofollow, dir_fd=directory_fd)
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError("approval artifact is not a regular file")
+            content = self._read_descriptor(file_fd)
+            return relative.as_posix(), content
+        except OSError as exc:
+            raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读普通文件", step) from exc
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _windows_artifact_snapshot(
+        self, supplied: Path, relative: Path, step: str
+    ) -> tuple[str, bytes]:
+        """Fallback identity checks where Windows cannot supply O_NOFOLLOW reliably."""
+        descriptor: int | None = None
+        try:
+            before = supplied.lstat()
+            if stat.S_ISLNK(before.st_mode):
+                raise OSError("approval artifact is a symlink")
             resolved = supplied.resolve(strict=True)
             resolved.relative_to(self.root)
-            mode = resolved.stat().st_mode
+            descriptor = os.open(supplied, os.O_RDONLY)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("approval artifact is not a regular file")
+            content = self._read_descriptor(descriptor)
+            after = supplied.lstat()
+            followed = supplied.stat()
+            if (
+                stat.S_ISLNK(after.st_mode)
+                or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+                or (opened.st_dev, opened.st_ino) != (followed.st_dev, followed.st_ino)
+            ):
+                raise OSError("approval artifact changed while being read")
+            # Resolve again after the descriptor read so a replacement cannot turn a
+            # project path into an escaped path between the checks above.
+            supplied.resolve(strict=True).relative_to(self.root)
+            return relative.as_posix(), content
         except (OSError, ValueError) as exc:
-            raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读文件", step) from exc
-        if not stat.S_ISREG(mode) or not os.access(resolved, os.R_OK):
-            raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读普通文件", step)
-        return resolved
+            raise self._error("approval_artifact_invalid", "审批工件必须是项目内可读普通文件", step) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def _read_descriptor(descriptor: int) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
 
     @staticmethod
     def _error(

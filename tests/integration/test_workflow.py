@@ -12,6 +12,7 @@ from product_factory.contracts.models import (
 from product_factory.domain.approvals import APPROVAL_STATEMENT
 from product_factory.errors import FactoryError
 from product_factory.services.initialize import check_inputs, initialize_project
+from product_factory.services import workflow as workflow_service
 from product_factory.services.workflow import WorkflowService
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
@@ -75,7 +76,7 @@ def test_adaptation_approval_is_audited_and_exact(tmp_path: Path) -> None:
     _inputs_checked(root)
     artifact = root / "docs/technical-adaptation.md"
     artifact.write_text("selected offline path\n", encoding="utf-8")
-    service = WorkflowService(root)
+    service = WorkflowService(root, evidence_current=lambda *_args: True)
     lock = _lock(root, 1)
 
     pending = service.request_approval(
@@ -115,7 +116,7 @@ def test_adaptation_approval_rejects_changed_or_unsafe_artifact(tmp_path: Path) 
     artifact = root / "docs/technical-adaptation.md"
     artifact.write_text("v1", encoding="utf-8")
     lock = _lock(root, 1)
-    service = WorkflowService(root)
+    service = WorkflowService(root, evidence_current=lambda *_args: True)
     service.request_approval(GateType.TECHNICAL_ADAPTATION, Path("docs/technical-adaptation.md"), lock.lock_id, 1)
     _release(root, lock.lock_id)
     artifact.write_text("v2", encoding="utf-8")
@@ -153,7 +154,7 @@ def test_stage_acceptance_keeps_evidence_and_requires_verified_state(tmp_path: P
         }
     )
     repo.save_state(state, expected_revision=0)
-    service = WorkflowService(root)
+    service = WorkflowService(root, evidence_current=lambda *_args: True)
     lock = _lock(root, 1)
     pending = service.request_approval(GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1)
     assert pending.workflow_state is WorkflowState.HUMAN_ACCEPTANCE_PENDING
@@ -176,6 +177,7 @@ def test_rejects_wrong_gate_state_and_changed_stage_acceptance_scope(tmp_path: P
         service.request_approval(GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1)
     assert caught.value.code == "transition_not_allowed"
     _release(root, lock.lock_id)
+    service = WorkflowService(root, evidence_current=lambda *_args: True)
 
     repo = ProjectRepository(root)
     checked = repo.load_state()
@@ -221,3 +223,116 @@ def test_development_and_system_verification_are_lock_fenced(tmp_path: Path) -> 
     verified = service.mark_system_verified("evidence-01", lock.lock_id, 2)
     assert verified.current_stage.completion_level is CompletionLevel.SYSTEM_VERIFIED
     assert verified.last_valid_evidence_id == "evidence-01"
+
+
+def test_approval_retry_reuses_the_single_durable_record_after_state_save_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _root(tmp_path)
+    _inputs_checked(root)
+    (root / "docs/technical-adaptation.md").write_text("v1", encoding="utf-8")
+    service = WorkflowService(root)
+    lock = _lock(root, 1)
+    service.request_approval(GateType.TECHNICAL_ADAPTATION, Path("docs/technical-adaptation.md"), lock.lock_id, 1)
+    _release(root, lock.lock_id)
+    lock = _lock(root, 2)
+    original_save = ProjectRepository.save_state
+    failed_once = False
+
+    def fail_after_approval(self: ProjectRepository, *args: object, **kwargs: object):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("disk full")
+        return original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(ProjectRepository, "save_state", fail_after_approval)
+    with pytest.raises(OSError):
+        service.approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 2)
+    assert len(ProjectRepository(root).read_approvals()) == 1
+
+    approved = service.approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 2)
+    approvals = ProjectRepository(root).read_approvals()
+    assert approved.revision == 3
+    assert len(approvals) == 1
+    assert approvals[0].request_id == approvals[0].request_id
+    assert approvals[0].state_revision == 2
+
+
+def test_stage_acceptance_requires_an_injected_current_evidence_validator(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state()
+    verified = state.model_copy(
+        update={
+            "revision": 1,
+            "workflow_state": WorkflowState.SYSTEM_VERIFICATION,
+            "current_stage": state.current_stage.model_copy(
+                update={"completion_level": CompletionLevel.SYSTEM_VERIFIED}
+            ),
+            "last_valid_evidence_id": "evidence-01",
+        }
+    )
+    repo.save_state(verified, 0)
+    lock = _lock(root, 1)
+    with pytest.raises(FactoryError) as caught:
+        WorkflowService(root).request_approval(GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1)
+    assert caught.value.code == "evidence_validation_required"
+    with pytest.raises(FactoryError) as caught:
+        WorkflowService(root, evidence_current=lambda *_args: False).request_approval(
+            GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1
+        )
+    assert caught.value.code == "evidence_invalid"
+    pending = WorkflowService(root, evidence_current=lambda *_args: True).request_approval(
+        GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1
+    )
+    assert pending.workflow_state is WorkflowState.HUMAN_ACCEPTANCE_PENDING
+
+
+def test_descriptor_snapshot_rejects_replacement_with_an_outside_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _root(tmp_path)
+    _inputs_checked(root)
+    artifact = root / "docs/technical-adaptation.md"
+    artifact.write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside-secret", encoding="utf-8")
+    original_open = workflow_service.os.open
+    replaced = False
+
+    def replace_before_file_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal replaced
+        if not replaced and path == "technical-adaptation.md" and "dir_fd" in kwargs:
+            replaced = True
+            artifact.unlink()
+            artifact.symlink_to(outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(workflow_service.os, "open", replace_before_file_open)
+    lock = _lock(root, 1)
+    with pytest.raises(FactoryError) as caught:
+        WorkflowService(root).request_approval(
+            GateType.TECHNICAL_ADAPTATION, Path("docs/technical-adaptation.md"), lock.lock_id, 1
+        )
+    assert caught.value.code == "approval_artifact_invalid"
+    state = ProjectRepository(root).load_state()
+    assert state.workflow_state is WorkflowState.INPUTS_CHECKED
+    assert state.waiting_on is None
+
+
+def test_project_identity_mismatch_blocks_mutations_without_audit_writes(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    _inputs_checked(root)
+    repo = ProjectRepository(root)
+    state = repo.load_state()
+    repo.save_state(state.model_copy(update={"project_id": "wrong-project", "revision": 2}), 1)
+    (root / "docs/technical-adaptation.md").write_text("v1", encoding="utf-8")
+    lock = _lock(root, 2)
+    with pytest.raises(FactoryError) as caught:
+        WorkflowService(root).request_approval(
+            GateType.TECHNICAL_ADAPTATION, Path("docs/technical-adaptation.md"), lock.lock_id, 2
+        )
+    assert caught.value.code == "project_identity_mismatch"
+    assert ProjectRepository(root).read_approvals() == []
+    assert [event.event_type for event in ProjectRepository(root).read_events()] == ["inputs_checked"]
