@@ -161,6 +161,7 @@ def test_failed_manifest_publication_keeps_the_evidence_id_reserved(
     events: list[str] = []
     synced: list[Path] = []
     original_mkdir = repository_module.os.mkdir
+    original_fsync_parent = repository_module._fsync_parent_directory
 
     def track_reservation_mkdir(path: str | Path, *args: object, **kwargs: object) -> None:
         original_mkdir(path, *args, **kwargs)
@@ -168,9 +169,12 @@ def test_failed_manifest_publication_keeps_the_evidence_id_reserved(
             events.append("mkdir")
 
     def record_reservation_sync(path: Path) -> None:
-        synced.append(path)
         if path == directory:
+            original_fsync_parent(path)
+            synced.append(path)
             events.append("fsync")
+            return
+        original_fsync_parent(path)
 
     def fail_publication(*_args: object, **_kwargs: object) -> None:
         events.append("write")
@@ -241,7 +245,8 @@ def test_evidence_reservation_sync_failure_propagates_and_keeps_id_reserved(
         if Path(path) == directory:
             events.append("mkdir")
 
-    def fail_reservation_sync(_path: Path) -> None:
+    def fail_reservation_sync(path: Path) -> None:
+        assert path == directory
         events.append("fsync")
         raise OSError("directory sync failed")
 
