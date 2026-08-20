@@ -63,6 +63,15 @@ class LockManager:
             content = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
+        except UnicodeDecodeError as exc:
+            raise FactoryError(
+                "lock_invalid",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "执行锁文件无效",
+                "lock status",
+                True,
+                "释放或显式接管执行锁",
+            ) from exc
         except OSError as exc:
             raise FactoryError(
                 "lock_unreadable",

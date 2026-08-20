@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from product_factory.contracts.models import LockOwner
+from product_factory.contracts.models import ApprovalRecord, EventRecord, GateType, LockOwner, WaitingOn, WorkflowState
+from product_factory.domain.approvals import APPROVAL_STATEMENT
 from product_factory.errors import FactoryError
 from product_factory.services.initialize import initialize_project
 from product_factory.storage.locks import LockManager
@@ -124,8 +126,74 @@ def test_resume_never_recommends_repair_when_the_audit_log_is_damaged(tmp_path: 
     repo.save_state(state.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
     repo.paths.events.write_text("{partial", encoding="utf-8")
     summary = resume_project(root)
-    assert summary.audit_status == "invalid"
+    assert summary.audit_status == "missing_referenced_event"
     assert summary.next_command == "product-factory validate"
+
+
+def test_pending_approval_written_before_state_commit_is_a_valid_resume_point(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    current = repo.load_state()
+    waiting = WaitingOn(
+        type="approval", request_id="request-01", gate_type=GateType.TECHNICAL_ADAPTATION,
+        scope={"artifact": "docs/technical-adaptation.md"},
+    )
+    revision_one = current.model_copy(update={"revision": 1})
+    repo.save_state(revision_one, 0)
+    pending = revision_one.model_copy(update={
+        "revision": 2, "workflow_state": WorkflowState.ADAPTATION_PENDING_APPROVAL, "waiting_on": waiting,
+    })
+    repo.save_state(pending, 1)
+    repo.append_approval(ApprovalRecord(
+        schema_version="1.0", approval_id="approval-01", request_id=waiting.request_id,
+        gate_type=waiting.gate_type, scope=waiting.scope, state_revision=2,
+        statement=APPROVAL_STATEMENT, actor="owner", source="interactive_cli",
+        created_at=datetime.now(timezone.utc), consumed_by_revision=3,
+    ))
+    assert validate_project(root).valid is True
+    assert resume_project(root).next_command == "product-factory approve"
+
+
+def test_resume_reports_expired_and_invalid_locks_without_mutation_guidance(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project
+
+    root = _root(tmp_path)
+    expired = LockManager(root, now_fn=lambda: datetime(2000, 1, 1, tzinfo=timezone.utc))
+    expired.acquire(LockOwner(tool="pytest", session_id="expired", pid=1, host="local"), 0, timedelta(minutes=1))
+    summary = resume_project(root)
+    assert summary.lock_status == "expired"
+    assert summary.next_command == "product-factory lock takeover"
+    (root / ".product-factory/execution-lock.json").write_bytes(b"\xff")
+    summary = resume_project(root)
+    assert summary.lock_status == "invalid"
+    assert summary.next_command == "product-factory validate"
+
+
+def test_validation_binds_event_and_evidence_records_to_current_state(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    project, state = repo.load_project(), repo.load_state()
+    repo.append_event(EventRecord(
+        schema_version="1.0", event_id="future", event_type="inputs_checked", project_id=project.project_id,
+        before_revision=98, after_revision=99, created_at=datetime.now(timezone.utc), details={},
+    ))
+    repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "wanted"}), 0)
+    path = repo.evidence_path("stage-01", "wanted")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "evidence_id": "other", "stage_id": "stage-01", "state_revision": 1,
+        "factory_version": project.factory_version, "prd_sha256": project.prd.sha256, "source_digest": "a" * 64,
+        "checks": [{"name": "check", "command": "true", "started_at": "2026-08-20T00:00:00Z", "ended_at": "2026-08-20T00:00:01Z", "exit_status": 0, "summary": "ok", "mode": "mock"}],
+        "ready_for_human_acceptance": True,
+    }), encoding="utf-8")
+    report = validate_project(root)
+    assert "event_revision_future" in report.findings
+    assert "referenced_evidence_id_mismatch" in report.findings
+    assert resume_project(root).evidence_status == "invalid"
 
 
 def test_repair_appends_only_the_referenced_event_and_retries_are_singleton(tmp_path: Path) -> None:
@@ -162,5 +230,6 @@ def test_repair_requires_current_lock_and_never_appends_after_malformed_tail(tmp
     lock_id = _lock(root, 1)
     with pytest.raises(FactoryError) as caught:
         repair_audit(root, lock_id, 1)
-    assert caught.value.code == "audit_repair_not_safe"
+    assert caught.value.code == "audit_repair_unsafe"
+    assert caught.value.details == {"findings": ["event_invalid:line:1", "missing_referenced_event"]}
     assert repo.paths.events.read_bytes() == before
