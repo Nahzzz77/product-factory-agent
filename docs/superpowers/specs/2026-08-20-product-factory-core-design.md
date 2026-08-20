@@ -329,9 +329,10 @@ product-factory lock release
 product-factory lock takeover
 product-factory resume
 product-factory validate
+product-factory repair-audit
 ```
 
-所有写命令必须验证项目身份、Schema、修订号和执行锁。`status`、`resume` 和 `validate` 为只读命令，不得隐式修改项目。
+所有写命令必须验证项目身份、Schema、修订号和执行锁。`status`、`resume` 和 `validate` 为只读命令，不得隐式修改项目。`repair-audit` 是显式写命令，只能补写由当前 `state.last_event_id` 明确引用但缺失的恢复事件，不能改变业务状态。
 
 CLI 默认不接受密钥参数。任何未来需要外部凭证的命令只能读取已批准的秘密载体，并且不得在输出中显示实际值。
 
@@ -347,7 +348,7 @@ CLI 默认不接受密钥参数。任何未来需要外部凭证的命令只能�
 4. 预先分配状态转换事件 ID，原子写入引用审批 ID 和该事件 ID 的新状态。
 5. 追加预先分配的状态转换事件。
 
-如果步骤 3 后中断，系统只会留下尚未消费的有效审批，状态不会跨阶段；恢复时可以重新执行转换。如果状态写入后事件追加失败，`resume` 根据 `state.last_event_id` 检测审计缺口并追加恢复事件，不能回退已经原子生效的状态。
+如果步骤 3 后中断，系统只会留下尚未消费的有效审批，状态不会跨阶段；恢复时可以重新执行转换。如果状态写入后事件追加失败，`resume` 根据 `state.last_event_id` 检测审计缺口并提示运行 `repair-audit`。`repair-audit` 在取得执行锁并确认状态修订未变化后补写恢复事件，不能回退或改变已经原子生效的业务状态。
 
 `resume` 必须检查：
 
