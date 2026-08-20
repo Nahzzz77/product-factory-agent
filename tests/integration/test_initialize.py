@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 from threading import Event, Thread
 
@@ -210,6 +211,135 @@ def test_initialize_preflight_failures_do_not_mutate_target(
         assert list(target.iterdir()) == []
     else:
         assert not target.exists()
+
+
+@pytest.mark.parametrize("preexisting_empty_target", [False, True])
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "/tmp/handbook.md",
+        "C:/outside/handbook.md",
+        "../outside.md",
+        "references/handbooks/../../outside.md",
+        "references\\handbooks\\outside.md",
+    ],
+)
+def test_initialize_rejects_unsafe_handbook_paths_before_target_writes(
+    tmp_path: Path, preexisting_empty_target: bool, unsafe_path: str
+) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    factory_root = tmp_path / "factory"
+    manifest = factory_root / "references/handbooks/manifest.yaml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {"title": "Unsafe", "version": "1", "path": unsafe_path, "sha256": "0" * 64}
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    if preexisting_empty_target:
+        target.mkdir()
+
+    with pytest.raises(FactoryError) as caught:
+        initialize_project(
+            target, "demo-web", "Demo", prd, intake, [("stage-01", "Core", False)], factory_root
+        )
+
+    assert caught.value.code == "handbook_invalid"
+    assert list(target.iterdir()) == [] if target.exists() else not target.exists()
+
+
+@pytest.mark.parametrize("preexisting_empty_target", [False, True])
+def test_initialize_rejects_handbook_symlink_escaping_factory_root(
+    tmp_path: Path, preexisting_empty_target: bool
+) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    factory_root = tmp_path / "factory"
+    handbook = factory_root / "references/handbooks/link.md"
+    handbook.parent.mkdir(parents=True)
+    handbook.symlink_to(outside)
+    manifest = handbook.parent / "manifest.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "title": "Escaped",
+                        "version": "1",
+                        "path": "references/handbooks/link.md",
+                        "sha256": hashlib.sha256(b"outside").hexdigest(),
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    if preexisting_empty_target:
+        target.mkdir()
+
+    with pytest.raises(FactoryError) as caught:
+        initialize_project(
+            target, "demo-web", "Demo", prd, intake, [("stage-01", "Core", False)], factory_root
+        )
+
+    assert caught.value.code == "handbook_invalid"
+    assert list(target.iterdir()) == [] if target.exists() else not target.exists()
+
+
+def test_initialize_keeps_a_safe_nested_handbook_path_and_digest(tmp_path: Path) -> None:
+    prd = tmp_path / "source-prd.md"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    intake = tmp_path / "source-intake.yaml"
+    write_intake(intake)
+    factory_root = tmp_path / "factory"
+    handbook = factory_root / "references/handbooks/nested/guide.md"
+    handbook.parent.mkdir(parents=True)
+    handbook_bytes = b"safe handbook\n"
+    handbook.write_bytes(handbook_bytes)
+    manifest = factory_root / "references/handbooks/manifest.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "documents": [
+                    {
+                        "title": "Nested",
+                        "version": "1",
+                        "path": "references/handbooks/nested/guide.md",
+                        "sha256": hashlib.sha256(handbook_bytes).hexdigest(),
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    initialize_project(
+        tmp_path / "target", "demo-web", "Demo", prd, intake, [("stage-01", "Core", False)], factory_root
+    )
+
+    reference = ProjectRepository(tmp_path / "target").load_project().handbooks[0]
+    assert reference.path == "references/handbooks/nested/guide.md"
+    assert reference.sha256 == hashlib.sha256(handbook_bytes).hexdigest()
 
 
 def test_initialize_rejects_invalid_intake_before_creating_target(tmp_path: Path) -> None:

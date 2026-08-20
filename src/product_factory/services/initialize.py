@@ -1,9 +1,11 @@
 """New-project initialization and deterministic PRD intake validation."""
 
 import hashlib
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Iterable
 
 import yaml
@@ -317,10 +319,8 @@ def _load_handbooks(factory_root: Path) -> list[HandbookReference]:
         for document in documents:
             if not isinstance(document, dict):
                 raise ValueError("handbook manifest entry must be a mapping")
-            relative_path = document["path"]
-            if not isinstance(relative_path, str):
-                raise ValueError("handbook path must be a string")
-            content = (factory_root / relative_path).read_bytes()
+            relative_path, handbook_path = _safe_handbook_path(factory_root, document["path"])
+            content = handbook_path.read_bytes()
             digest = hashlib.sha256(content).hexdigest()
             if document.get("sha256") != digest:
                 raise ValueError("handbook digest mismatch")
@@ -332,7 +332,7 @@ def _load_handbooks(factory_root: Path) -> list[HandbookReference]:
                     sha256=digest,
                 )
             )
-    except (KeyError, OSError, TypeError, ValidationError, ValueError, yaml.YAMLError) as exc:
+    except (KeyError, OSError, RuntimeError, TypeError, ValidationError, ValueError, yaml.YAMLError) as exc:
         raise FactoryError(
             "handbook_invalid",
             ErrorCategory.INPUT_REQUIRED,
@@ -342,3 +342,22 @@ def _load_handbooks(factory_root: Path) -> list[HandbookReference]:
             "修复手册清单及其引用文件后重试",
         ) from exc
     return handbooks
+
+
+def _safe_handbook_path(factory_root: Path, value: object) -> tuple[str, Path]:
+    """Return only a canonical project-relative handbook file, never an escaped path."""
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValueError("handbook path must be a canonical relative POSIX path")
+    if Path(value).is_absolute() or PureWindowsPath(value).is_absolute() or PureWindowsPath(value).drive:
+        raise ValueError("handbook path must not be absolute")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("handbook path contains an unsafe component")
+    canonical = "/".join(parts)
+    root = factory_root.resolve()
+    candidate = (root.joinpath(*parts)).resolve(strict=True)
+    if candidate == root or root not in candidate.parents:
+        raise ValueError("handbook path escapes the factory root")
+    if not candidate.is_file() or not os.access(candidate, os.R_OK):
+        raise ValueError("handbook path must name a readable regular file")
+    return canonical, candidate
