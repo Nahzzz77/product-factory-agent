@@ -14,6 +14,7 @@ from product_factory.storage.files import (
     atomic_write_json,
     atomic_write_yaml,
     contained_path,
+    exclusive_create_json,
     load_json,
     load_yaml,
     read_jsonl,
@@ -44,6 +45,7 @@ class ProjectRepository:
         atomic_write_json(self.paths.state, state.model_dump(mode="json"))
 
     def save_state(self, next_state: StateRecord, expected_revision: int) -> StateRecord:
+        """Persist a state transition after the caller acquires the project lease."""
         current = self.load_state()
         if current.revision != expected_revision or next_state.revision != expected_revision + 1:
             raise FactoryError(
@@ -87,7 +89,7 @@ class ProjectRepository:
 
     def save_evidence(self, record: EvidenceManifest) -> Path:
         path = self.evidence_path(record.stage_id, record.evidence_id)
-        if path.exists():
+        if not exclusive_create_json(path, record.model_dump(mode="json")):
             raise FactoryError(
                 "evidence_exists",
                 ErrorCategory.POLICY_BLOCKED,
@@ -96,7 +98,6 @@ class ProjectRepository:
                 False,
                 "使用新的 evidence_id",
             )
-        atomic_write_json(path, record.model_dump(mode="json"))
         return path
 
     def load_evidence(self, stage_id: str, evidence_id: str) -> EvidenceManifest:

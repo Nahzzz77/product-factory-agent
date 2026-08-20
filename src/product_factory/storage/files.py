@@ -51,6 +51,28 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def exclusive_create_json(path: Path, payload: dict[str, Any]) -> bool:
+    """Create a JSON document once, returning False when its path already exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except FileExistsError:
+        return False
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+    _fsync_parent_directory(path)
+    return True
+
+
 def atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:
     _atomic_write_text(path, yaml.safe_dump(payload, allow_unicode=True, sort_keys=False))
 
