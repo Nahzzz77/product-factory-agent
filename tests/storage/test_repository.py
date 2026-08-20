@@ -1,4 +1,3 @@
-import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -15,7 +14,7 @@ from product_factory.contracts.models import (
     WorkflowState,
 )
 from product_factory.errors import FactoryError
-from product_factory.storage import files
+from product_factory.storage import repository as repository_module
 from product_factory.storage.repository import ProjectRepository
 
 
@@ -113,24 +112,10 @@ def test_save_state_rejects_a_non_sequential_next_revision(tmp_path: Path) -> No
     assert caught.value.code == "revision_conflict"
 
 
-def test_concurrent_evidence_creation_preserves_only_the_winner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_concurrent_evidence_reservation_preserves_only_the_winner(tmp_path: Path) -> None:
     repo = ProjectRepository(tmp_path)
     manifests = [make_evidence("b" * 64), make_evidence("c" * 64)]
-    target = repo.evidence_path("stage-01", "evidence-01")
-    original_open = files.os.open
     start_together = threading.Barrier(2)
-    loser_reported = threading.Event()
-    release_final_writer = threading.Event()
-
-    def delay_final_file_write(path: str | Path, flags: int, mode: int = 0o777) -> int:
-        descriptor = original_open(path, flags, mode)
-        if Path(path) == target and flags & os.O_EXCL:
-            release_final_writer.wait(timeout=5)
-        return descriptor
-
-    monkeypatch.setattr(files.os, "open", delay_final_file_write)
 
     def contender(record: EvidenceManifest) -> tuple[str, EvidenceManifest]:
         start_together.wait(timeout=5)
@@ -138,26 +123,50 @@ def test_concurrent_evidence_creation_preserves_only_the_winner(
             repo.save_evidence(record)
         except FactoryError as exc:
             assert exc.code == "evidence_exists"
-            loser_reported.set()
             return "error", record
         return "success", record
 
-    def read_after_loser_observes_existing_evidence() -> EvidenceManifest:
-        assert loser_reported.wait(timeout=5)
-        try:
-            return repo.load_evidence("stage-01", "evidence-01")
-        finally:
-            release_final_writer.set()
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=2) as executor:
         contenders = [executor.submit(contender, record) for record in manifests]
-        reader = executor.submit(read_after_loser_observes_existing_evidence)
         outcomes = [future.result() for future in contenders]
-        observed = reader.result()
 
     winners = [record for status, record in outcomes if status == "success"]
     losers = [record for status, record in outcomes if status == "error"]
     assert len(winners) == 1
     assert len(losers) == 1
-    assert observed == winners[0]
     assert repo.load_evidence("stage-01", "evidence-01") == winners[0]
+
+
+@pytest.mark.parametrize("contents", [None, "foreign"])
+def test_existing_evidence_directory_is_never_reused(tmp_path: Path, contents: str | None) -> None:
+    repo = ProjectRepository(tmp_path)
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    directory.mkdir(parents=True)
+    if contents is not None:
+        (directory / "foreign.txt").write_text(contents, encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+
+    with pytest.raises(FactoryError) as caught:
+        repo.save_evidence(make_evidence("b" * 64))
+
+    assert caught.value.code == "evidence_exists"
+    assert {path.name: path.read_bytes() for path in directory.iterdir()} == before
+
+
+def test_failed_manifest_publication_keeps_the_evidence_id_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = ProjectRepository(tmp_path)
+
+    def fail_publication(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(repository_module, "atomic_write_json", fail_publication)
+    with pytest.raises(OSError):
+        repo.save_evidence(make_evidence("b" * 64))
+    directory = repo.evidence_path("stage-01", "evidence-01").parent
+    assert directory.is_dir()
+    assert not (directory / "manifest.json").exists()
+    with pytest.raises(FactoryError) as caught:
+        repo.save_evidence(make_evidence("c" * 64))
+    assert caught.value.code == "evidence_exists"

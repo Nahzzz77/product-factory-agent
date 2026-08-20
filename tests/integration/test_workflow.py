@@ -220,9 +220,11 @@ def test_development_and_system_verification_are_lock_fenced(tmp_path: Path) -> 
     assert verifying.current_stage.completion_level is CompletionLevel.IMPLEMENTED
     _release(root, lock.lock_id)
     lock = _lock(root, 2)
-    verified = service.mark_system_verified("evidence-01", lock.lock_id, 2)
-    assert verified.current_stage.completion_level is CompletionLevel.SYSTEM_VERIFIED
-    assert verified.last_valid_evidence_id == "evidence-01"
+    with pytest.raises(FactoryError) as caught:
+        service.mark_system_verified("evidence-01", lock.lock_id, 2)
+    assert caught.value.code == "evidence_missing"
+    state = ProjectRepository(root).load_state()
+    assert state.current_stage.completion_level is CompletionLevel.IMPLEMENTED
 
 
 def test_approval_retry_reuses_the_single_durable_record_after_state_save_failure(

@@ -1,5 +1,6 @@
 """End-to-end evidence recording and verification rules."""
 
+import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -165,6 +166,60 @@ def test_digest_excludes_secrets_but_includes_env_example_and_configured_globs(t
     assert compute_source_digest(tmp_path, ["generated/**"]) != first
 
 
+def test_digest_uses_global_posix_path_order_not_walk_order(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "a/z").write_bytes(b"nested")
+    (tmp_path / "a.txt").write_bytes(b"root")
+    expected = hashlib.sha256()
+    for relative, content in (("a.txt", b"root"), ("a/z", b"nested")):
+        expected.update(relative.encode("utf-8"))
+        expected.update(b"\0")
+        expected.update(content)
+        expected.update(b"\0")
+    assert compute_source_digest(tmp_path, []) == expected.hexdigest()
+
+
+def test_configured_globs_are_root_anchored_and_slash_aware(tmp_path: Path) -> None:
+    (tmp_path / "docs/sub").mkdir(parents=True)
+    (tmp_path / "docs/guide.md").write_text("root guide", encoding="utf-8")
+    (tmp_path / "docs/sub/guide.md").write_text("nested guide", encoding="utf-8")
+    direct_only = compute_source_digest(tmp_path, ["docs/*.md"])
+    (tmp_path / "docs/guide.md").write_text("changed root guide", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["docs/*.md"]) == direct_only
+    (tmp_path / "docs/sub/guide.md").write_text("changed nested guide", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["docs/*.md"]) != direct_only
+
+    (tmp_path / "generated").mkdir()
+    (tmp_path / "generated/result.txt").write_text("root generated", encoding="utf-8")
+    (tmp_path / "x/generated").mkdir(parents=True)
+    (tmp_path / "x/generated/result.txt").write_text("nested generated", encoding="utf-8")
+    root_only = compute_source_digest(tmp_path, ["generated/*"])
+    (tmp_path / "generated/result.txt").write_text("changed root generated", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["generated/*"]) == root_only
+    (tmp_path / "x/generated/result.txt").write_text("changed nested generated", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["generated/*"]) != root_only
+
+    all_markdown = compute_source_digest(tmp_path, ["**/*.md"])
+    (tmp_path / "README.md").write_text("root markdown", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["**/*.md"]) == all_markdown
+    (tmp_path / "docs/sub/guide.md").write_text("changed markdown again", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["**/*.md"]) == all_markdown
+
+
+@pytest.mark.parametrize("pattern", ["/docs/*.md", "docs\\*.md", "../docs/*.md", "docs/../*.md", "."])
+def test_configured_globs_reject_unsafe_paths_and_normalize_dot_segments(
+    tmp_path: Path, pattern: str
+) -> None:
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/guide.md").write_text("guide", encoding="utf-8")
+    assert compute_source_digest(tmp_path, ["./docs/*.md"]) == compute_source_digest(
+        tmp_path, ["docs/*.md"]
+    )
+    with pytest.raises(FactoryError) as caught:
+        compute_source_digest(tmp_path, [pattern])
+    assert caught.value.code == "source_exclude_invalid"
+
+
 def test_record_evidence_recomputes_identity_fields_and_never_reuses_an_id(tmp_path: Path) -> None:
     root = _root(tmp_path)
     manifest = _record(root, _authoring(root))
@@ -247,4 +302,25 @@ def test_stage_acceptance_uses_current_evidence_before_request_and_consume(tmp_p
     with pytest.raises(FactoryError) as caught:
         WorkflowService(root).approve(APPROVAL_STATEMENT, "owner", lock.lock_id, 6)
     assert caught.value.code == "evidence_invalid"
+    LockManager(root).release(lock.lock_id)
+
+
+def test_public_mark_system_verified_requires_current_valid_evidence(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    service = WorkflowService(root)
+    lock = _lock(root, 4)
+    with pytest.raises(FactoryError) as caught:
+        service.mark_system_verified("missing-evidence", lock.lock_id, 4)
+    assert caught.value.code == "evidence_missing"
+    assert ProjectRepository(root).load_state().current_stage.completion_level is CompletionLevel.IMPLEMENTED
+    LockManager(root).release(lock.lock_id)
+
+    _record(root, _authoring(root, exit_status=1))
+    lock = _lock(root, 4)
+    with pytest.raises(FactoryError) as caught:
+        service.mark_system_verified("evidence-01", lock.lock_id, 4)
+    assert caught.value.code == "evidence_invalid"
+    state = ProjectRepository(root).load_state()
+    assert state.revision == 4
+    assert state.current_stage.completion_level is CompletionLevel.IMPLEMENTED
     LockManager(root).release(lock.lock_id)

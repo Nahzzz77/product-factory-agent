@@ -213,20 +213,29 @@ class WorkflowService:
     def mark_system_verified(
         self, evidence_id: str, lock_id: str, expected_revision: int
     ) -> StateRecord:
-        """Internal Task 8 entry point that commits an already-validated evidence ID."""
-        with self.locks.mutation(lock_id, expected_revision):
-            repo = ProjectRepository(self.root)
-            _project, current = self._context(repo, expected_revision, "mark_system_verified")
-            return self._mark_system_verified_locked(repo, current, evidence_id, expected_revision)
+        """Compatibility entry point that validates evidence before any state transition."""
+        from product_factory.services.evidence import verify_stage
 
-    def _mark_system_verified_locked(
+        return verify_stage(self.root, evidence_id, lock_id, expected_revision)
+
+    def _commit_system_verified_locked(
         self,
         repo: ProjectRepository,
+        project: ProjectRecord,
         current: StateRecord,
         evidence_id: str,
         expected_revision: int,
     ) -> StateRecord:
-        """Commit verification only while the caller already owns ``locks.mutation``."""
+        """Commit evidence already validated by ``verify_stage`` inside its held mutation mutex."""
+        if current.project_id != project.project_id:
+            raise FactoryError(
+                "project_identity_mismatch",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "项目状态与项目元数据的标识不一致",
+                "mark_system_verified",
+                False,
+                "修复项目元数据后重试",
+            )
         self._require_no_waiting(current, "mark_system_verified")
         if (
             current.workflow_state is not WorkflowState.SYSTEM_VERIFICATION

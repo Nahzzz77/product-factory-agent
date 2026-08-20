@@ -1,5 +1,4 @@
 import os
-import uuid
 from pathlib import Path
 
 from product_factory.contracts.models import (
@@ -12,12 +11,10 @@ from product_factory.contracts.models import (
 )
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.storage.files import (
-    _fsync_parent_directory,
     append_jsonl,
     atomic_write_json,
     atomic_write_yaml,
     contained_path,
-    exclusive_create_json,
     load_json,
     load_yaml,
     read_jsonl,
@@ -89,23 +86,11 @@ class ProjectRepository:
 
     def save_evidence(self, record: EvidenceManifest) -> Path:
         directory = self._evidence_directory(record.stage_id, record.evidence_id)
-        temporary = directory.parent / f".{directory.name}.{uuid.uuid4().hex}.tmp"
-        published = False
         try:
             directory.parent.mkdir(parents=True, exist_ok=True)
-            if directory.exists():
-                raise FileExistsError(directory)
-            # Write a complete manifest in a private sibling directory, then use
-            # one non-replacing directory rename as the evidence-ID reservation.
-            # A competing reader can therefore observe either no evidence or a
-            # complete immutable manifest, never a reserved empty directory.
-            os.mkdir(temporary)
-            path = temporary / "manifest.json"
-            if not exclusive_create_json(path, record.model_dump(mode="json")):
-                raise OSError("could not create private evidence manifest")
-            os.rename(temporary, directory)
-            _fsync_parent_directory(directory)
-            published = True
+            # ``mkdir`` is the reservation point: it neither reuses an empty
+            # pre-existing evidence directory nor replaces any populated one.
+            os.mkdir(directory)
         except FileExistsError as exc:
             raise FactoryError(
                 "evidence_exists",
@@ -115,25 +100,11 @@ class ProjectRepository:
                 False,
                 "使用新的 evidence_id",
             ) from exc
-        except OSError as exc:
-            # POSIX reports a concurrently-created non-empty destination as
-            # ENOTEMPTY rather than FileExistsError for directory rename.
-            if directory.exists():
-                raise FactoryError(
-                    "evidence_exists",
-                    ErrorCategory.POLICY_BLOCKED,
-                    "证据 ID 已存在",
-                    "record_evidence",
-                    False,
-                    "使用新的 evidence_id",
-                ) from exc
-            raise
-        finally:
-            if not published:
-                (temporary / "manifest.json").unlink(missing_ok=True)
-                if temporary.exists():
-                    temporary.rmdir()
-        return directory / "manifest.json"
+        path = directory / "manifest.json"
+        # If durable publication fails, retain the reservation.  Future calls
+        # must use a new ID rather than overwriting an interrupted evidence run.
+        atomic_write_json(path, record.model_dump(mode="json"))
+        return path
 
     def load_evidence(self, stage_id: str, evidence_id: str) -> EvidenceManifest:
         return EvidenceManifest.model_validate(load_json(self.evidence_path(stage_id, evidence_id)))

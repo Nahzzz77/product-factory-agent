@@ -24,6 +24,7 @@ from product_factory.storage.repository import ProjectRepository
 _STATIC_EXCLUDED_PARTS = frozenset(
     {".git", ".product-factory", ".venv", "build", "dist", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 )
+_ExcludePattern = tuple[str, ...]
 
 
 def compute_source_digest(root: Path, source_excludes: list[str]) -> str:
@@ -35,7 +36,8 @@ def compute_source_digest(root: Path, source_excludes: list[str]) -> str:
     """
     root = root.resolve()
     try:
-        before = _source_snapshot(root, source_excludes)
+        patterns = _compile_exclude_patterns(source_excludes)
+        before = tuple(sorted(_source_snapshot(root, patterns), key=lambda item: item[0].as_posix()))
         digest = hashlib.sha256()
         for relative, _signature in before:
             content = read_contained_regular_bytes(root, relative.parts)
@@ -43,7 +45,7 @@ def compute_source_digest(root: Path, source_excludes: list[str]) -> str:
             digest.update(b"\0")
             digest.update(content)
             digest.update(b"\0")
-        after = _source_snapshot(root, source_excludes)
+        after = tuple(sorted(_source_snapshot(root, patterns), key=lambda item: item[0].as_posix()))
     except FactoryError:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -113,8 +115,8 @@ def verify_stage(root: Path, evidence_id: str, lock_id: str, expected_revision: 
         # acceptance validator, while this operation needs its already-held helper.
         from product_factory.services.workflow import WorkflowService
 
-        return WorkflowService(root)._mark_system_verified_locked(
-            repo, state, evidence_id, expected_revision
+        return WorkflowService(root)._commit_system_verified_locked(
+            repo, project, state, evidence_id, expected_revision
         )
 
 
@@ -222,7 +224,9 @@ def _authoring_relative_path(root: Path, supplied: Path) -> PurePosixPath:
     return PurePosixPath(*relative.parts)
 
 
-def _source_snapshot(root: Path, patterns: list[str]) -> tuple[tuple[PurePosixPath, tuple[int, int, int, int, int]], ...]:
+def _source_snapshot(
+    root: Path, patterns: tuple[_ExcludePattern, ...]
+) -> tuple[tuple[PurePosixPath, tuple[int, int, int, int, int]], ...]:
     if not root.is_dir():
         raise ValueError("source root is not a directory")
     if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
@@ -231,7 +235,7 @@ def _source_snapshot(root: Path, patterns: list[str]) -> tuple[tuple[PurePosixPa
 
 
 def _walk_posix_snapshot(
-    root: Path, patterns: list[str]
+    root: Path, patterns: tuple[_ExcludePattern, ...]
 ) -> Iterator[tuple[PurePosixPath, tuple[int, int, int, int, int]]]:
     root_fd: int | None = None
     try:
@@ -243,7 +247,7 @@ def _walk_posix_snapshot(
 
 
 def _walk_posix_directory(
-    directory_fd: int, prefix: PurePosixPath, patterns: list[str]
+    directory_fd: int, prefix: PurePosixPath, patterns: tuple[_ExcludePattern, ...]
 ) -> Iterator[tuple[PurePosixPath, tuple[int, int, int, int, int]]]:
     entries = sorted(list(os.scandir(directory_fd)), key=lambda item: item.name)
     for entry in entries:
@@ -268,9 +272,11 @@ def _walk_posix_directory(
 
 
 def _walk_fallback_snapshot(
-    root: Path, patterns: list[str]
+    root: Path, patterns: tuple[_ExcludePattern, ...]
 ) -> Iterator[tuple[PurePosixPath, tuple[int, int, int, int, int]]]:
-    def walk(directory: Path, prefix: PurePosixPath) -> Iterator[tuple[PurePosixPath, tuple[int, int, int, int, int]]]:
+    def walk(
+        directory: Path, prefix: PurePosixPath
+    ) -> Iterator[tuple[PurePosixPath, tuple[int, int, int, int, int]]]:
         for entry in sorted(directory.iterdir(), key=lambda item: item.name):
             relative = prefix / entry.name
             if _excluded(relative, patterns):
@@ -290,14 +296,57 @@ def _walk_fallback_snapshot(
     yield from walk(root, PurePosixPath())
 
 
-def _excluded(relative: PurePosixPath, patterns: list[str]) -> bool:
+def _excluded(relative: PurePosixPath, patterns: tuple[_ExcludePattern, ...]) -> bool:
     parts = relative.parts
     if any(part in _STATIC_EXCLUDED_PARTS for part in parts):
         return True
     if any(part == ".env" or (part.startswith(".env.") and part != ".env.example") for part in parts):
         return True
-    value = relative.as_posix()
-    return any(fnmatch.fnmatchcase(value, pattern) or relative.match(pattern) for pattern in patterns)
+    return any(_glob_matches(pattern, parts) for pattern in patterns)
+
+
+def _compile_exclude_patterns(patterns: list[str]) -> tuple[_ExcludePattern, ...]:
+    return tuple(_normalize_exclude_pattern(pattern) for pattern in patterns)
+
+
+def _normalize_exclude_pattern(pattern: str) -> _ExcludePattern:
+    if not pattern or pattern.startswith("/") or "\\" in pattern:
+        raise _invalid_exclude_error()
+    normalized: list[str] = []
+    for segment in pattern.split("/"):
+        if not segment or segment == "..":
+            raise _invalid_exclude_error()
+        if segment != ".":
+            normalized.append(segment)
+    if not normalized:
+        raise _invalid_exclude_error()
+    return tuple(normalized)
+
+
+def _glob_matches(pattern: _ExcludePattern, path: tuple[str, ...]) -> bool:
+    """Match root-relative POSIX path segments; `**` spans zero or more segments."""
+    memo: dict[tuple[int, int], bool] = {}
+
+    def matches(pattern_index: int, path_index: int) -> bool:
+        key = (pattern_index, path_index)
+        if key in memo:
+            return memo[key]
+        if pattern_index == len(pattern):
+            result = path_index == len(path)
+        elif pattern[pattern_index] == "**":
+            result = matches(pattern_index + 1, path_index) or (
+                path_index < len(path) and matches(pattern_index, path_index + 1)
+            )
+        else:
+            result = (
+                path_index < len(path)
+                and fnmatch.fnmatchcase(path[path_index], pattern[pattern_index])
+                and matches(pattern_index + 1, path_index + 1)
+            )
+        memo[key] = result
+        return result
+
+    return matches(0, 0)
 
 
 def _signature(item: os.stat_result) -> tuple[int, int, int, int, int]:
@@ -312,4 +361,15 @@ def _unstable_digest_error() -> FactoryError:
         "source_digest",
         True,
         "停止并发写入后重新计算摘要",
+    )
+
+
+def _invalid_exclude_error() -> FactoryError:
+    return FactoryError(
+        "source_exclude_invalid",
+        ErrorCategory.INPUT_REQUIRED,
+        "源码摘要排除模式必须是安全的根目录相对 POSIX glob",
+        "source_digest",
+        False,
+        "使用不含绝对路径、反斜杠或上级目录的 glob",
     )
