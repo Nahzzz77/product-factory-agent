@@ -314,8 +314,14 @@ def _validate_evidence(
         return
     try:
         manifest = repo.load_evidence(state.current_stage.id, state.last_valid_evidence_id)
-    except (OSError, ValueError, ValidationError, FactoryError):
+    except FileNotFoundError:
         _add(findings, "missing_referenced_evidence")
+        return
+    except (ValueError, ValidationError):
+        _add(findings, "referenced_evidence_invalid")
+        return
+    except (OSError, FactoryError):
+        _add(findings, "referenced_evidence_unverifiable")
         return
     identity_invalid = False
     if manifest.evidence_id != state.last_valid_evidence_id:
@@ -350,26 +356,55 @@ def _lock_status(root: Path) -> str:
 def _evidence_status(findings: list[str], state: StateRecord | None) -> str:
     if state is None or state.last_valid_evidence_id is None:
         return "not_recorded"
-    if any(finding.startswith("referenced_evidence_") for finding in findings):
-        return "invalid"
     if "missing_referenced_evidence" in findings:
         return "missing"
-    if "stale_referenced_evidence" in findings:
-        return "stale"
     if "referenced_evidence_unverifiable" in findings:
         return "unverifiable"
+    if "stale_referenced_evidence" in findings:
+        return "stale"
+    if any(
+        finding in {
+            "referenced_evidence_invalid",
+            "referenced_evidence_id_mismatch",
+            "referenced_evidence_stage_mismatch",
+            "referenced_evidence_revision_future",
+        }
+        for finding in findings
+    ):
+        return "invalid"
     return "current"
 
 
 def _audit_status(findings: list[str]) -> str:
-    if "missing_referenced_event" in findings:
+    audit_findings = [finding for finding in findings if _is_audit_finding(finding)]
+    if audit_findings == ["missing_referenced_event"]:
         return "missing_referenced_event"
-    if any(
-        finding.startswith(("approval_", "event_", "duplicate_approval", "duplicate_event", "referenced_event", "recovered_event"))
-        for finding in findings
-    ):
+    if audit_findings:
         return "invalid"
     return "complete"
+
+
+def _is_audit_finding(finding: str) -> bool:
+    if finding.startswith(
+        (
+            "approval_",
+            "event_",
+            "duplicate_approval",
+            "duplicate_event",
+            "referenced_event",
+            "recovered_event",
+        )
+    ):
+        return True
+    return finding in {
+        "missing_referenced_event",
+        "project_id_mismatch",
+        "project_invalid",
+        "intake_invalid",
+        "state_invalid",
+        "unknown_current_stage",
+        "current_stage_sequence_mismatch",
+    }
 
 
 def _only_repairable_audit_gap(findings: list[str]) -> bool:

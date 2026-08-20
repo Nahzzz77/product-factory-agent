@@ -11,7 +11,7 @@ import pytest
 
 from product_factory.contracts.models import ApprovalRecord, EventRecord, GateType, LockOwner, WaitingOn, WorkflowState
 from product_factory.domain.approvals import APPROVAL_STATEMENT
-from product_factory.errors import FactoryError
+from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.initialize import initialize_project
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
@@ -126,7 +126,7 @@ def test_resume_never_recommends_repair_when_the_audit_log_is_damaged(tmp_path: 
     repo.save_state(state.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
     repo.paths.events.write_text("{partial", encoding="utf-8")
     summary = resume_project(root)
-    assert summary.audit_status == "missing_referenced_event"
+    assert summary.audit_status == "invalid"
     assert summary.next_command == "product-factory validate"
 
 
@@ -194,6 +194,31 @@ def test_validation_binds_event_and_evidence_records_to_current_state(tmp_path: 
     assert "event_revision_future" in report.findings
     assert "referenced_evidence_id_mismatch" in report.findings
     assert resume_project(root).evidence_status == "invalid"
+
+
+def test_resume_reports_unverifiable_evidence_without_mutation_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from product_factory.services import recovery
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    project, state = repo.load_project(), repo.load_state()
+    repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "wanted"}), 0)
+    path = repo.evidence_path("stage-01", "wanted")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "evidence_id": "wanted", "stage_id": "stage-01", "state_revision": 1,
+        "factory_version": project.factory_version, "prd_sha256": project.prd.sha256, "source_digest": "a" * 64,
+        "checks": [{"name": "check", "command": "true", "started_at": "2026-08-20T00:00:00Z", "ended_at": "2026-08-20T00:00:01Z", "exit_status": 0, "summary": "ok", "mode": "mock"}],
+        "ready_for_human_acceptance": True,
+    }), encoding="utf-8")
+    monkeypatch.setattr(recovery, "compute_source_digest", lambda *_args: (_ for _ in ()).throw(
+        FactoryError("source_digest_unstable", ErrorCategory.ENVIRONMENT_BLOCKED, "unstable", "digest", True, "retry")
+    ))
+    summary = recovery.resume_project(root)
+    assert summary.evidence_status == "unverifiable"
+    assert summary.next_command == "product-factory validate"
 
 
 def test_repair_appends_only_the_referenced_event_and_retries_are_singleton(tmp_path: Path) -> None:
