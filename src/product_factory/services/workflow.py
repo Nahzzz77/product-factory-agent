@@ -35,8 +35,12 @@ class WorkflowService:
     def __init__(self, root: Path, evidence_current: EvidenceCurrentValidator | None = None):
         self.root = root.resolve()
         self.locks = LockManager(self.root)
-        # Task 8 injects the real digest-and-manifest verifier.  Safe by default:
-        # this layer never turns an evidence ID into a human gate on its own.
+        if evidence_current is None:
+            # Kept lazy so the evidence service can call the private already-held
+            # commit helper without a module-import cycle.
+            from product_factory.services.evidence import evidence_current as default_evidence_current
+
+            evidence_current = default_evidence_current
         self.evidence_current = evidence_current
 
     def request_approval(
@@ -213,31 +217,41 @@ class WorkflowService:
         with self.locks.mutation(lock_id, expected_revision):
             repo = ProjectRepository(self.root)
             _project, current = self._context(repo, expected_revision, "mark_system_verified")
-            self._require_no_waiting(current, "mark_system_verified")
-            if (
-                current.workflow_state is not WorkflowState.SYSTEM_VERIFICATION
-                or current.current_stage.completion_level is not CompletionLevel.IMPLEMENTED
-            ):
-                raise self._error("transition_not_allowed", "当前状态不能登记系统验证", "mark_system_verified")
-            if not evidence_id:
-                raise self._error("evidence_missing", "必须提供已验证证据 ID", "mark_system_verified")
-            next_state = current.model_copy(
-                update={
-                    "revision": expected_revision + 1,
-                    "current_stage": current.current_stage.model_copy(
-                        update={"completion_level": CompletionLevel.SYSTEM_VERIFIED}
-                    ),
-                    "last_valid_evidence_id": evidence_id,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            )
-            return commit_state_change(
-                repo,
-                current,
-                next_state,
-                "system_verified",
-                {"stage_id": current.current_stage.id, "evidence_id": evidence_id},
-            )
+            return self._mark_system_verified_locked(repo, current, evidence_id, expected_revision)
+
+    def _mark_system_verified_locked(
+        self,
+        repo: ProjectRepository,
+        current: StateRecord,
+        evidence_id: str,
+        expected_revision: int,
+    ) -> StateRecord:
+        """Commit verification only while the caller already owns ``locks.mutation``."""
+        self._require_no_waiting(current, "mark_system_verified")
+        if (
+            current.workflow_state is not WorkflowState.SYSTEM_VERIFICATION
+            or current.current_stage.completion_level is not CompletionLevel.IMPLEMENTED
+        ):
+            raise self._error("transition_not_allowed", "当前状态不能登记系统验证", "mark_system_verified")
+        if not evidence_id:
+            raise self._error("evidence_missing", "必须提供已验证证据 ID", "mark_system_verified")
+        next_state = current.model_copy(
+            update={
+                "revision": expected_revision + 1,
+                "current_stage": current.current_stage.model_copy(
+                    update={"completion_level": CompletionLevel.SYSTEM_VERIFIED}
+                ),
+                "last_valid_evidence_id": evidence_id,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
+        return commit_state_change(
+            repo,
+            current,
+            next_state,
+            "system_verified",
+            {"stage_id": current.current_stage.id, "evidence_id": evidence_id},
+        )
 
     def _context(
         self, repo: ProjectRepository, expected_revision: int, step: str

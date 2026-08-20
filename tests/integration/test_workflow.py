@@ -264,7 +264,7 @@ def test_approval_retry_reuses_the_single_durable_record_after_state_save_failur
     assert approvals[0].state_revision == 2
 
 
-def test_stage_acceptance_requires_an_injected_current_evidence_validator(tmp_path: Path) -> None:
+def test_stage_acceptance_uses_the_default_current_evidence_validator(tmp_path: Path) -> None:
     root = _root(tmp_path)
     repo = ProjectRepository(root)
     state = repo.load_state()
@@ -282,7 +282,7 @@ def test_stage_acceptance_requires_an_injected_current_evidence_validator(tmp_pa
     lock = _lock(root, 1)
     with pytest.raises(FactoryError) as caught:
         WorkflowService(root).request_approval(GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1)
-    assert caught.value.code == "evidence_validation_required"
+    assert caught.value.code == "evidence_invalid"
     with pytest.raises(FactoryError) as caught:
         WorkflowService(root, evidence_current=lambda *_args: False).request_approval(
             GateType.STAGE_ACCEPTANCE, None, lock.lock_id, 1
