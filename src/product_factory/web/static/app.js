@@ -1,5 +1,14 @@
-const state = { config: null, projects: [], current: null, runId: null, runTimer: null };
+const state = { config: null, projects: [], current: null, runId: null, runTimer: null, runHistory: [], runtimeFilter: "all" };
 const $ = (selector) => document.querySelector(selector);
+const runtimeStepCopy = {
+  initialized: ["项目已创建", "PRD 基线已固化"],
+  inputs_checked: ["输入已确认", "需求可以开工"],
+  adaptation_pending_approval: ["技术方案审批", "等待你确认方案"],
+  stage_development: ["阶段开发", "Codex 执行与测试"],
+  system_verification: ["系统验证", "证据绑定当前代码"],
+  human_acceptance_pending: ["人工验收", "等待产品负责人"],
+  next_stage_or_frontend: ["里程碑完成", "等待下一阶段"],
+};
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -123,6 +132,8 @@ function emptyMessage(message) { const item = document.createElement("div"); ite
 async function openProject(path) {
   const payload = await api(`/api/project?path=${encodeURIComponent(path)}`);
   state.current = payload;
+  state.runHistory = [];
+  state.runtimeFilter = "all";
   $("#home-link").classList.remove("active");
   $("#empty-view").classList.add("hidden");
   $("#dashboard-view").classList.add("hidden");
@@ -163,6 +174,7 @@ function renderProject() {
   renderProjectContent(item);
   renderAgentAvailability(item);
   renderRun(item.agent_run);
+  renderRuntime(item);
 }
 
 function renderProjectContent(item) {
@@ -215,6 +227,170 @@ function renderActivity(activity) {
     const copy = document.createElement("div"); const title = document.createElement("b"); title.textContent = activityLabel(item.type);
     const meta = document.createElement("small"); meta.textContent = `${formatTime(item.created_at)} · 版本 ${item.revision}`; copy.append(title, meta); row.append(dot, copy); root.append(row);
   }
+}
+
+function renderRuntime(item = state.current) {
+  if (!item?.runtime) return;
+  const runtime = item.runtime;
+  const currentCopy = runtimeStepCopy[runtime.current_state] || [labelState(runtime.current_state), "查看当前项目协议状态"];
+  text("#runtime-current-state", currentCopy[0]);
+  text("#runtime-current-description", runtimeCurrentDescription(item, currentCopy[1]));
+  text("#runtime-revision", `r${runtime.revision}`);
+  text("#runtime-stage", `${item.state.current_stage.id} · ${labelCompletion(runtime.completion_level)}`);
+  text("#runtime-updated", formatDateTime(runtime.updated_at));
+  text("#runtime-recovery-text", item.validation.valid ? "审计记录与当前状态一致。" : `发现 ${item.validation.findings.length} 个需要处理的记录问题。`);
+  text("#runtime-next-command", item.recovery.next_command || "暂无恢复操作");
+  text("#runtime-health-text", item.validation.valid ? "记录正常" : "已暂停写入");
+  text("#runtime-health-icon", item.validation.valid ? "✓" : "!");
+  $("#runtime-health-card").classList.toggle("invalid", !item.validation.valid);
+  renderRuntimeStateMachine(runtime);
+  renderRuntimeAgent(item);
+  renderRuntimeFacts(item);
+  renderRuntimeTimeline(item);
+}
+
+function runtimeCurrentDescription(item, fallback) {
+  if (!item.validation.valid) return "项目记录不一致，为避免扩大问题，已停止后续写入。";
+  if (item.state.waiting_on) return `正在等待人工审批：${gateLabel(item.state.waiting_on.gate_type)}。`;
+  if (item.agent_run?.status === "running") return "Codex 正在当前阶段执行任务，输出会自动刷新。";
+  return fallback;
+}
+
+function renderRuntimeStateMachine(runtime) {
+  const root = $("#runtime-state-machine"); root.replaceChildren();
+  let reached = 0;
+  runtime.states.forEach((step, index) => {
+    const copy = runtimeStepCopy[step.id] || [labelState(step.id), step.id];
+    const node = document.createElement("li"); node.className = step.status;
+    const marker = document.createElement("span"); marker.className = "runtime-state-marker"; marker.textContent = step.status === "complete" ? "✓" : String(index + 1);
+    const body = document.createElement("div"); const title = document.createElement("b"); title.textContent = copy[0];
+    const note = document.createElement("small"); note.textContent = copy[1]; body.append(title, note); node.append(marker, body); root.append(node);
+    if (step.status !== "pending") reached += 1;
+  });
+  text("#runtime-machine-progress", `${reached} / ${runtime.states.length}`);
+}
+
+function latestRuntimeRun(item = state.current) {
+  return state.runHistory[0] || item?.agent_run || null;
+}
+
+function renderRuntimeAgent(item) {
+  const run = latestRuntimeRun(item);
+  const indicator = $("#runtime-agent-indicator");
+  const openButton = $("#runtime-open-agent-run");
+  if (!run) {
+    indicator.className = "idle";
+    text("#runtime-agent-status", "还没有运行记录");
+    text("#runtime-agent-objective", "启动 Codex 后，这里会实时显示任务状态。");
+    text("#runtime-log-status", "无记录");
+    text("#runtime-log-preview", "还没有 Codex 输出。");
+    openButton.classList.add("hidden");
+    return;
+  }
+  indicator.className = run.status;
+  text("#runtime-agent-status", runStatusLabel(run.status));
+  text("#runtime-agent-objective", run.objective);
+  text("#runtime-log-status", runSummaryLabel(run.status));
+  text("#runtime-log-preview", run.output ? run.output.slice(-6000) : "等待 Codex 输出…");
+  openButton.classList.remove("hidden");
+  openButton.dataset.runId = run.run_id;
+}
+
+function renderRuntimeFacts(item) {
+  const root = $("#runtime-facts"); root.replaceChildren();
+  const facts = [
+    ["工作流", labelState(item.state.workflow_state)],
+    ["完成级别", labelCompletion(item.state.current_stage.completion_level)],
+    ["修订号", `r${item.state.revision}`],
+    ["等待对象", item.state.waiting_on ? gateLabel(item.state.waiting_on.gate_type) : "无"],
+    ["有效证据", item.state.last_valid_evidence_id || "无"],
+    ["执行锁", item.lock ? "使用中" : "空闲"],
+    ["审计事件", String(item.stats.events)],
+    ["人工审批", String(item.stats.approvals)],
+  ];
+  for (const [name, value] of facts) {
+    const row = document.createElement("div"); const term = document.createElement("dt"); const detail = document.createElement("dd");
+    term.textContent = name; detail.textContent = value; row.append(term, detail); root.append(row);
+  }
+}
+
+function renderRuntimeTimeline(item = state.current) {
+  if (!item?.runtime) return;
+  const auditEntries = item.runtime.timeline.map((entry) => ({ ...entry, category: runtimeCategory(entry) }));
+  const runEntries = state.runHistory.map((run) => ({
+    kind: "agent", category: "agent", type: "agent_run", record_id: run.run_id,
+    created_at: run.started_at, revision: null, before_revision: null, after_revision: null,
+    details: { objective: run.objective, status: run.status, exit_code: run.exit_code, finished_at: run.finished_at }, run,
+  }));
+  const entries = [...auditEntries, ...runEntries]
+    .filter((entry) => state.runtimeFilter === "all" || entry.category === state.runtimeFilter)
+    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
+  const root = $("#runtime-timeline"); root.replaceChildren();
+  if (!entries.length) { root.append(emptyMessage("这个分类还没有运行记录")); return; }
+  for (const entry of entries) root.append(runtimeTimelineEntry(entry));
+}
+
+function runtimeTimelineEntry(entry) {
+  const row = document.createElement("article"); row.className = `runtime-event ${entry.category}`;
+  const rail = document.createElement("div"); rail.className = "runtime-event-rail"; const dot = document.createElement("span"); rail.append(dot);
+  const body = document.createElement("div"); body.className = "runtime-event-body";
+  const top = document.createElement("div"); top.className = "runtime-event-top";
+  const badge = document.createElement("span"); badge.className = "runtime-event-badge"; badge.textContent = runtimeCategoryLabel(entry.category);
+  const time = document.createElement("time"); time.textContent = formatDateTime(entry.created_at); top.append(badge, time);
+  const title = document.createElement("h4"); title.textContent = runtimeEntryTitle(entry);
+  const description = document.createElement("p"); description.textContent = runtimeEntryDescription(entry);
+  const meta = document.createElement("div"); meta.className = "runtime-event-meta";
+  const revision = entry.before_revision === null || entry.before_revision === undefined ? "Codex 任务" : entry.before_revision === entry.after_revision ? `r${entry.after_revision}` : `r${entry.before_revision} → r${entry.after_revision}`;
+  meta.textContent = `${revision} · ${entry.record_id}`;
+  body.append(top, title, description, meta);
+  if (entry.run) {
+    const button = document.createElement("button"); button.className = "text-button"; button.textContent = "查看输出";
+    button.addEventListener("click", () => { renderRun(entry.run); $("#agent-dialog").showModal(); }); body.append(button);
+  } else if (entry.details && Object.keys(entry.details).length) {
+    const details = document.createElement("details"); const summary = document.createElement("summary"); summary.textContent = "查看原始记录";
+    const pre = document.createElement("pre"); pre.textContent = JSON.stringify(entry.details, null, 2); details.append(summary, pre); body.append(details);
+  }
+  row.append(rail, body); return row;
+}
+
+function runtimeCategory(entry) {
+  if (entry.kind === "agent") return "agent";
+  if (entry.kind === "approval") return "approval";
+  if (entry.kind === "event" && entry.before_revision !== entry.after_revision) return "state";
+  return "system";
+}
+
+function runtimeCategoryLabel(category) { return ({ state: "状态流转", approval: "人工审批", agent: "CODEX", system: "系统记录" })[category] || category; }
+function runtimeEntryTitle(entry) { return entry.kind === "agent" ? `${runSummaryLabel(entry.details.status)}：${entry.details.objective}` : activityLabel(entry.type); }
+function runtimeEntryDescription(entry) {
+  if (entry.kind === "agent") return entry.details.exit_code === null ? "任务输出已保存在项目中。" : `任务已结束，退出码 ${entry.details.exit_code}。`;
+  if (entry.kind === "approval") return `由 ${entry.details.actor || "未知操作人"} 完成 ${gateLabel(entry.type)}。`;
+  return ({
+    project_initialized: "项目已创建，PRD 摘要与初始状态已固化。",
+    inputs_checked: "输入已核对，项目可以进入技术方案阶段。",
+    approval_requested: `已发起 ${gateLabel(entry.details.gate_type)}，当前等待人工操作。`,
+    approval_consumed: `审批已被状态机消费，开始执行 ${gateLabel(entry.details.gate_type)} 后续流程。`,
+    implementation_recorded: "当前阶段实现已记录，状态进入系统验证。",
+    evidence_recorded: "测试与运行证据已登记为不可变记录。",
+    system_verified: "当前代码与证据校验通过。",
+    recovered_missing_event: "已恢复状态引用但审计日志缺失的事件。",
+    lock_takeover_authorized: "过期执行锁已经过明确原因审计后接管。",
+  })[entry.type] || "该协议操作已记录在项目审计日志中。";
+}
+
+function gateLabel(value) { return ({ technical_adaptation: "技术方案审批", stage_acceptance: "阶段人工验收" })[value] || value || "人工审批"; }
+function formatDateTime(value) { if (!value) return "时间未记录"; return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(value)); }
+
+async function refreshRuntime() {
+  if (!state.current) return;
+  try {
+    const path = state.current.path;
+    state.current = await api(`/api/project?path=${encodeURIComponent(path)}`);
+    renderProject();
+    await loadRunHistory();
+    switchTab("runtime");
+    showToast("运行状态已刷新");
+  } catch (error) { showToast(error.message); }
 }
 
 function switchTab(tab) {
@@ -426,8 +602,9 @@ async function loadRunHistory() {
   if (!state.current) { root.replaceChildren(); return; }
   try {
     const payload = await api(`/api/agent-runs?project_path=${encodeURIComponent(state.current.path)}`);
+    state.runHistory = payload.runs;
     root.replaceChildren();
-    if (!payload.runs.length) { root.append(emptyMessage("还没有 Codex 运行记录")); return; }
+    if (!payload.runs.length) { root.append(emptyMessage("还没有 Codex 运行记录")); renderRuntime(state.current); return; }
     for (const run of payload.runs.slice(0, 10)) {
       const row = document.createElement("button"); row.className = "run-history-row";
       const status = document.createElement("span"); status.className = `run-status ${run.status}`; status.textContent = runStatusLabel(run.status).replace("Codex ", "");
@@ -436,7 +613,8 @@ async function loadRunHistory() {
       const time = document.createElement("time"); time.textContent = formatTime(run.started_at);
       row.append(status, copy, time); row.addEventListener("click", () => { renderRun(run); $("#agent-dialog").showModal(); }); root.append(row);
     }
-  } catch (error) { root.replaceChildren(emptyMessage(error.message)); }
+    renderRuntime(state.current);
+  } catch (error) { state.runHistory = []; root.replaceChildren(emptyMessage(error.message)); renderRuntime(state.current); }
 }
 
 function runStatusLabel(status) {
@@ -450,7 +628,7 @@ function runSummaryLabel(status) {
 function labelState(value) { return ({ initialized: "已初始化", inputs_checked: "输入已确认", adaptation_pending_approval: "等待技术审批", stage_development: "阶段开发", system_verification: "系统验证", human_acceptance_pending: "等待人工验收", next_stage_or_frontend: "里程碑完成" })[value] || value; }
 function labelCompletion(value) { return ({ none: "尚未实现", implemented: "已实现", system_verified: "系统已验证", human_accepted: "人工已验收" })[value] || value; }
 function progressPercent(value) { return ({ initialized: 8, inputs_checked: 22, adaptation_pending_approval: 34, stage_development: 52, system_verification: 72, human_acceptance_pending: 88, next_stage_or_frontend: 100 })[value] || 5; }
-function activityLabel(value) { return ({ inputs_checked: "项目输入已确认", approval_requested: "发起人工确认", approval_consumed: "人工确认已记录", implementation_recorded: "开发实现已完成", evidence_recorded: "验证证据已登记", system_verified: "系统验证已通过", technical_adaptation: "技术方案已批准", stage_acceptance: "阶段验收已批准" })[value] || value.replaceAll("_", " "); }
+function activityLabel(value) { return ({ project_initialized: "项目已创建", inputs_checked: "项目输入已确认", approval_requested: "发起人工确认", approval_consumed: "人工确认已记录", implementation_recorded: "开发实现已完成", evidence_recorded: "验证证据已登记", system_verified: "系统验证已通过", technical_adaptation: "技术方案已批准", stage_acceptance: "阶段验收已批准", recovered_missing_event: "审计记录已恢复", lock_takeover_authorized: "执行锁已接管" })[value] || value.replaceAll("_", " "); }
 function formatTime(value) { if (!value) return "刚刚"; const date = new Date(value); return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date); }
 
 function openCreate() { $("#create-error").classList.add("hidden"); $("#create-dialog").showModal(); }
@@ -504,6 +682,16 @@ $("#start-agent").addEventListener("click", startAgent);
 $("#refresh-run").addEventListener("click", refreshRun);
 $("#cancel-run").addEventListener("click", cancelRun);
 $("#refresh-history").addEventListener("click", loadRunHistory);
+$("#runtime-refresh").addEventListener("click", refreshRuntime);
+$("#runtime-open-agent-run").addEventListener("click", () => {
+  const run = latestRuntimeRun();
+  if (run) { renderRun(run); $("#agent-dialog").showModal(); }
+});
+document.querySelectorAll("[data-runtime-filter]").forEach((button) => button.addEventListener("click", () => {
+  state.runtimeFilter = button.dataset.runtimeFilter;
+  document.querySelectorAll("[data-runtime-filter]").forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+  renderRuntimeTimeline();
+}));
 $("#prd-file").addEventListener("change", () => updateFileName("prd"));
 $("#constraints-file").addEventListener("change", () => updateFileName("constraints"));
 $("#project-path").addEventListener("click", () => copyPath(state.current?.path || "", "项目路径已复制"));

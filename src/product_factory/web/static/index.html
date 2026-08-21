@@ -88,6 +88,7 @@
 
         <nav class="project-tabs" id="project-tabs" aria-label="项目内容">
           <button class="active" data-tab="overview">总览</button>
+          <button data-tab="runtime">运行状态</button>
           <button data-tab="requirements">需求</button>
           <button data-tab="plan">技术方案</button>
           <button data-tab="development">开发</button>
@@ -141,6 +142,65 @@
           <div><span>Agent 不会替你做决定</span><p>技术方案和产品验收都需要你确认。</p></div>
           <div><span>每一步都有记录</span><p>测试、审批和恢复信息都保存在项目里。</p></div>
         </section>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="runtime">
+          <div class="page-heading runtime-heading">
+            <div><p>PROJECT RUNTIME</p><h2>项目运行状态</h2><span>状态流转、人工审批、Codex 执行和恢复建议集中在这里。</span></div>
+            <button class="secondary runtime-refresh" id="runtime-refresh"><span>↻</span> 刷新状态</button>
+          </div>
+
+          <div class="runtime-overview-grid">
+            <article class="runtime-status-card runtime-primary-card">
+              <div class="runtime-card-label"><span class="runtime-live-dot"></span>当前状态</div>
+              <h3 id="runtime-current-state">—</h3>
+              <p id="runtime-current-description"></p>
+              <dl><div><dt>修订号</dt><dd id="runtime-revision">—</dd></div><div><dt>当前阶段</dt><dd id="runtime-stage">—</dd></div><div><dt>最后更新</dt><dd id="runtime-updated">—</dd></div></dl>
+            </article>
+            <article class="runtime-status-card">
+              <div class="runtime-card-label">CODEX 运行</div>
+              <div class="runtime-agent-line"><span id="runtime-agent-indicator"></span><strong id="runtime-agent-status">还没有运行记录</strong></div>
+              <p id="runtime-agent-objective">启动 Codex 后，这里会实时显示任务状态。</p>
+              <button class="text-button hidden" id="runtime-open-agent-run">查看完整输出 ↗</button>
+            </article>
+            <article class="runtime-status-card" id="runtime-health-card">
+              <div class="runtime-card-label">项目健康</div>
+              <div class="runtime-health-line"><span id="runtime-health-icon">✓</span><strong id="runtime-health-text">记录正常</strong></div>
+              <p id="runtime-recovery-text"></p>
+              <code id="runtime-next-command"></code>
+            </article>
+          </div>
+
+          <article class="runtime-machine-card">
+            <div class="runtime-section-head"><div><p>STATE MACHINE</p><h3>状态机</h3></div><span id="runtime-machine-progress">—</span></div>
+            <ol id="runtime-state-machine" class="runtime-state-machine" aria-label="项目状态机"></ol>
+          </article>
+
+          <div class="runtime-detail-grid">
+            <article class="runtime-timeline-card">
+              <div class="runtime-section-head runtime-timeline-head">
+                <div><p>AUDIT TRAIL</p><h3>运行时间轴</h3></div>
+                <div class="runtime-filters" role="group" aria-label="运行记录筛选">
+                  <button class="active" data-runtime-filter="all">全部</button>
+                  <button data-runtime-filter="state">状态</button>
+                  <button data-runtime-filter="approval">审批</button>
+                  <button data-runtime-filter="agent">Codex</button>
+                  <button data-runtime-filter="system">系统</button>
+                </div>
+              </div>
+              <div id="runtime-timeline" class="runtime-timeline"></div>
+            </article>
+            <aside class="runtime-side-column">
+              <article class="runtime-log-card">
+                <div class="runtime-section-head"><div><p>LATEST OUTPUT</p><h3>最近输出</h3></div><span id="runtime-log-status">—</span></div>
+                <pre id="runtime-log-preview">还没有 Codex 输出。</pre>
+              </article>
+              <article class="runtime-facts-card">
+                <div class="runtime-section-head"><div><p>PROTOCOL FACTS</p><h3>当前事实</h3></div></div>
+                <dl id="runtime-facts"></dl>
+              </article>
+            </aside>
+          </div>
         </section>
 
         <section class="tab-panel hidden" data-panel="requirements">

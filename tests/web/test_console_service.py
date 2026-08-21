@@ -41,6 +41,11 @@ def test_create_list_snapshot_and_check_inputs(tmp_path: Path) -> None:
     assert created["documents"][0]["exists"] is True
     assert "离线" in created["documents"][0]["content"]
     assert created["stats"] == {"events": 0, "approvals": 0, "evidence": 0}
+    assert created["runtime"]["current_state"] == "initialized"
+    assert created["runtime"]["states"][0] == {
+        "id": "initialized", "status": "current"
+    }
+    assert created["runtime"]["timeline"][0]["type"] == "project_initialized"
     assert [item["project_id"] for item in service.list_projects()] == ["demo"]
 
     checked = service.perform_action(tmp_path / "demo", "check_inputs", {})
@@ -49,7 +54,26 @@ def test_create_list_snapshot_and_check_inputs(tmp_path: Path) -> None:
     assert checked["lock"] is None
     assert checked["validation"]["valid"] is True
     assert checked["activity"][0]["type"] == "inputs_checked"
+    assert checked["runtime"]["states"][0]["status"] == "complete"
+    assert checked["runtime"]["states"][1]["status"] == "current"
+    assert [item["type"] for item in checked["runtime"]["timeline"]] == [
+        "inputs_checked", "project_initialized"
+    ]
+    assert checked["runtime"]["timeline"][0]["before_revision"] == 0
+    assert checked["runtime"]["timeline"][0]["after_revision"] == 1
+    assert checked["runtime"]["timeline"][0]["record_id"]
     assert not (tmp_path / "demo" / ".product-factory" / "execution-lock.json").exists()
+
+
+def test_runtime_view_assets_are_wired() -> None:
+    static = FACTORY_ROOT / "src/product_factory/web/static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    javascript = (static / "app.js").read_text(encoding="utf-8")
+
+    assert 'data-tab="runtime"' in html
+    assert 'id="runtime-state-machine"' in html
+    assert 'id="runtime-timeline"' in html
+    assert "function renderRuntime" in javascript
 
 
 def test_create_requires_explicit_prd_confirmation(tmp_path: Path) -> None:
@@ -277,6 +301,13 @@ def test_console_actions_cover_the_complete_core_milestone(tmp_path: Path) -> No
     assert final["state"]["current_stage"]["completion_level"] == "human_accepted"
     assert final["state"]["revision"] == 7
     assert final["validation"]["valid"] is True
+    assert final["runtime"]["current_state"] == "next_stage_or_frontend"
+    assert final["runtime"]["states"][-1]["status"] == "current"
+    approvals = [
+        item for item in final["runtime"]["timeline"] if item["kind"] == "approval"
+    ]
+    assert len(approvals) == 2
+    assert {item["details"]["actor"] for item in approvals} == {"product-owner"}
 
 
 def test_console_does_not_launch_agent_while_human_action_is_pending(tmp_path: Path) -> None:

@@ -18,12 +18,16 @@ import yaml
 
 from product_factory.cli.output import _normalise
 from product_factory.contracts.models import (
+    ApprovalRecord,
+    EventRecord,
     GateType,
     IntakeRecord,
     LockOwner,
+    ProjectRecord,
     REQUIREMENT_KEYS,
     RequirementDeclaration,
     RequirementStatus,
+    StateRecord,
     WorkflowState,
 )
 from product_factory.domain.approvals import APPROVAL_STATEMENT
@@ -40,6 +44,16 @@ from product_factory.storage.files import atomic_write_json, read_contained_regu
 
 _MAX_UPLOAD_BYTES = 1_000_000
 _MAX_AGENT_OUTPUT_BYTES = 100_000
+_MAX_RUNTIME_TIMELINE_ITEMS = 500
+_RUNTIME_STATES = (
+    WorkflowState.INITIALIZED,
+    WorkflowState.INPUTS_CHECKED,
+    WorkflowState.ADAPTATION_PENDING_APPROVAL,
+    WorkflowState.STAGE_DEVELOPMENT,
+    WorkflowState.SYSTEM_VERIFICATION,
+    WorkflowState.HUMAN_ACCEPTANCE_PENDING,
+    WorkflowState.NEXT_STAGE_OR_FRONTEND,
+)
 
 
 class AgentRunManager:
@@ -393,26 +407,7 @@ class ConsoleService:
         lock = LockManager(root).status()
         events = repo.read_events()
         approvals = repo.read_approvals()
-        activity = [
-            {
-                "kind": "event",
-                "type": event.event_type,
-                "created_at": event.created_at,
-                "revision": event.after_revision,
-                "details": event.details,
-            }
-            for event in events
-        ] + [
-            {
-                "kind": "approval",
-                "type": approval.gate_type.value,
-                "created_at": approval.created_at,
-                "revision": approval.consumed_by_revision,
-                "details": {"actor": approval.actor, "scope": approval.scope},
-            }
-            for approval in approvals
-        ]
-        activity.sort(key=lambda item: item["created_at"], reverse=True)
+        runtime = self._runtime(project, state, events, approvals)
         documents = [
             self._document(root, "prd", "产品需求文档", ("inputs", "PRD.md")),
             self._document(
@@ -430,7 +425,8 @@ class ConsoleService:
                 "lock": lock,
                 "agent_run": self.agent_runs.latest_for(root),
                 "documents": documents,
-                "activity": activity[:30],
+                "activity": runtime["timeline"],
+                "runtime": runtime,
                 "stats": {
                     "events": len(events),
                     "approvals": len(approvals),
@@ -438,6 +434,87 @@ class ConsoleService:
                 },
             }
         )
+
+    @staticmethod
+    def _runtime(
+        project: ProjectRecord,
+        state: StateRecord,
+        events: list[EventRecord],
+        approvals: list[ApprovalRecord],
+    ) -> dict[str, Any]:
+        try:
+            current_index = _RUNTIME_STATES.index(state.workflow_state)
+        except ValueError:
+            current_index = len(_RUNTIME_STATES)
+        states = [
+            {
+                "id": candidate.value,
+                "status": (
+                    "complete" if index < current_index
+                    else "current" if index == current_index
+                    else "pending"
+                ),
+            }
+            for index, candidate in enumerate(_RUNTIME_STATES)
+        ]
+        timeline: list[dict[str, Any]] = [
+            {
+                "kind": "project",
+                "type": "project_initialized",
+                "record_id": project.project_id,
+                "created_at": project.created_at,
+                "revision": 0,
+                "before_revision": 0,
+                "after_revision": 0,
+                "details": {
+                    "project_id": project.project_id,
+                    "prd_sha256": project.prd.sha256,
+                },
+            }
+        ]
+        timeline.extend(
+            {
+                "kind": "event",
+                "type": event.event_type,
+                "record_id": event.event_id,
+                "created_at": event.created_at,
+                "revision": event.after_revision,
+                "before_revision": event.before_revision,
+                "after_revision": event.after_revision,
+                "details": event.details,
+            }
+            for event in events
+        )
+        timeline.extend(
+            {
+                "kind": "approval",
+                "type": approval.gate_type.value,
+                "record_id": approval.approval_id,
+                "created_at": approval.created_at,
+                "revision": approval.consumed_by_revision,
+                "before_revision": approval.state_revision,
+                "after_revision": approval.consumed_by_revision,
+                "details": {
+                    "actor": approval.actor,
+                    "request_id": approval.request_id,
+                    "scope": approval.scope,
+                    "source": approval.source,
+                },
+            }
+            for approval in approvals
+        )
+        timeline.sort(key=lambda item: item["created_at"], reverse=True)
+        return {
+            "current_state": state.workflow_state.value,
+            "revision": state.revision,
+            "completion_level": state.current_stage.completion_level.value,
+            "updated_at": state.updated_at,
+            "waiting_on": state.waiting_on,
+            "states": states,
+            "timeline": timeline[:_MAX_RUNTIME_TIMELINE_ITEMS],
+            "timeline_total": len(timeline),
+            "timeline_truncated": len(timeline) > _MAX_RUNTIME_TIMELINE_ITEMS,
+        }
 
     @staticmethod
     def _document(root: Path, identifier: str, title: str, parts: tuple[str, ...]) -> dict[str, Any]:
