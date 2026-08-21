@@ -232,9 +232,10 @@ def _factory_root():
         with as_file(resource_root) as root:
             yield root
         return
-    # Editable source runs retain a development-only fallback.  Installed wheels
-    # never depend on the caller's working directory because they carry resources.
-    source_root = Path.cwd()
+    # Editable source runs retain a development-only fallback resolved from this
+    # module, never from the caller's working directory.  Installed wheels carry
+    # the resources inside the package and take the branch above.
+    source_root = Path(__file__).resolve().parents[3]
     if (source_root / "references/handbooks/manifest.yaml").is_file():
         yield source_root
         return

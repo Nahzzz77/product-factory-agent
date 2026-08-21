@@ -90,7 +90,7 @@ cp examples/minimal-project/evidence-manifest.yaml /tmp/minimal-web/evidence-aut
 
 - `inputs/PRD.md` 与 `.product-factory/intake.yaml`：确认过的产品输入和七类最低信息声明。
 - `.product-factory/state.json`：当前流程事实与递增修订号。
-- `.product-factory/approvals.jsonl` 与 `events.jsonl`：只追加的审批和审计记录。
+- `.product-factory/approvals.jsonl` 与 `.product-factory/events.jsonl`：只追加的审批和审计记录。
 - `.product-factory/execution-lock.json`：单写入者的租约记录；写操作需要它和匹配的修订号。
 - `.product-factory/evidence/<stage>/<evidence>/manifest.json`：一经登记即不可覆盖的阶段证据。
 
