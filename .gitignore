@@ -11,6 +11,10 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+启动日志/
+产品工厂.app/Contents/Resources/application/
+产品工厂.app/Contents/Resources/runtime/
+产品工厂.app/Contents/_CodeSignature/
 .env
 .env.*
 !.env.example

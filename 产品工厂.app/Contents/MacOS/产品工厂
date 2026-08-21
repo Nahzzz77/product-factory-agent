@@ -1,0 +1,61 @@
+#!/bin/zsh
+
+set -u
+
+bundle_dir=${0:A:h:h:h}
+current_user=$(/usr/bin/id -un)
+user_home=${HOME:-"/Users/$current_user"}
+workspace_dir=${PRODUCT_FACTORY_WORKSPACE:-"$user_home/ProductFactoryProjects"}
+workspace_port=${PRODUCT_FACTORY_PORT:-0}
+no_open=${PRODUCT_FACTORY_NO_OPEN:-0}
+runtime_python="$bundle_dir/Contents/Resources/runtime/bin/python"
+application_root="$bundle_dir/Contents/Resources/application"
+log_dir="$user_home/Library/Logs/ProductFactory"
+log_file="$log_dir/web-launcher.log"
+
+show_error() {
+  local message=$1
+  /usr/bin/osascript - "$message" "$log_file" <<'APPLESCRIPT'
+on run argv
+  set errorMessage to item 1 of argv
+  set logPath to item 2 of argv
+  display dialog (errorMessage & return & return & "启动日志：" & logPath) with title "产品工厂" buttons {"确定"} default button "确定" with icon stop
+end run
+APPLESCRIPT
+}
+
+if ! /bin/mkdir -p "$log_dir"; then
+  exit 1
+fi
+
+if [[ ! -x "$runtime_python" || ! -d "$application_root/product_factory" ]]; then
+  show_error "产品工厂应用不完整，请重新生成应用包。"
+  exit 1
+fi
+
+if ! /bin/mkdir -p "$workspace_dir"; then
+  show_error "无法创建项目工作区：$workspace_dir"
+  exit 1
+fi
+
+{
+  echo "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] 正在启动产品工厂"
+  echo "应用目录：$bundle_dir"
+  echo "项目目录：$workspace_dir"
+} >| "$log_file"
+
+launcher_args=(web --workspace "$workspace_dir" --port "$workspace_port")
+if [[ "$no_open" == "1" ]]; then
+  launcher_args+=(--no-open)
+fi
+
+PYTHONPATH="$application_root" PYTHONNOUSERSITE=1 "$runtime_python" -c \
+  'from product_factory.cli.main import main; raise SystemExit(main())' \
+  "${launcher_args[@]}" >> "$log_file" 2>&1
+exit_code=$?
+
+if (( exit_code != 0 && exit_code != 1 && exit_code != 129 && exit_code != 130 && exit_code != 143 )); then
+  show_error "产品工厂启动失败（错误码 $exit_code）。"
+fi
+
+exit $exit_code
