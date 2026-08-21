@@ -1,0 +1,27 @@
+schema_version: "1.0"
+project_id: "minimal-web"
+prd_confirmed: true
+confirmed_by: "product-owner"
+confirmed_at: "2026-08-20T00:00:00Z"
+requirements:
+  target_user_and_core_task:
+    status: present
+    source: "PRD §1"
+  input_process_output:
+    status: present
+    source: "PRD §2"
+  user_flow_and_confirmations:
+    status: present
+    source: "PRD §3"
+  scope_and_priority:
+    status: present
+    source: "PRD §4"
+  acceptance_criteria:
+    status: present
+    source: "PRD §5"
+  model_cost_platform:
+    status: present
+    source: "PRD §6"
+  data_privacy_performance_deployment:
+    status: present
+    source: "PRD §7"
