@@ -6,6 +6,7 @@ import argparse
 import errno
 import os
 import sys
+from pathlib import Path
 
 
 class ArgumentParseError(Exception):
@@ -67,6 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", dest="json_mode", help="输出稳定的 JSON 结果")
     commands = parser.add_subparsers(
         dest="command", required=True, parser_class=ProtocolArgumentParser
+    )
+
+    web = commands.add_parser("web", help="启动本地浏览器工作台")
+    web.add_argument(
+        "--workspace",
+        default=str(Path.home() / "ProductFactoryProjects"),
+        help="产品项目所在的本地工作区",
+    )
+    web.add_argument("--host", default="127.0.0.1", help="监听地址，默认仅本机")
+    web.add_argument("--port", type=int, default=8765, help="监听端口")
+    web.add_argument("--no-open", action="store_true", help="不要自动打开浏览器")
+    web.add_argument(
+        "--allow-network", action="store_true", help="显式允许监听非本机地址（不推荐）"
     )
 
     init = commands.add_parser("init", help="初始化一个新的受管项目")
