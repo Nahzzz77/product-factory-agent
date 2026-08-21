@@ -63,10 +63,11 @@ def test_portable_identifier_rejects_windows_devices_and_non_nfc(value: str) -> 
     assert not is_portable_path_component(value)
 
 
-def test_portable_identifier_limits_encoded_lengths_and_accepts_nfc_unicode() -> None:
-    assert is_portable_path_component("证据-é")
-    assert not is_portable_path_component("é" * 128)  # 256 UTF-8 bytes
-    assert not is_portable_path_component("a" * 256)
+def test_portable_identifier_uses_a_schema_expressible_unicode_subset() -> None:
+    assert is_portable_path_component("证据-01")
+    assert not is_portable_path_component("é")
+    assert not is_portable_path_component("é" * 128)
+    assert not is_portable_path_component("a" * 86)
 
 
 def test_workflow_collector_rejects_inputs_checked_as_implemented() -> None:
@@ -80,7 +81,7 @@ def test_workflow_collector_rejects_inputs_checked_as_implemented() -> None:
     )
     findings: list[str] = []
     _validate_workflow_invariants(state, findings)
-    assert findings == ["workflow_invariant_invalid"]
+    assert findings == ["workflow_invariant_invalid", "workflow_revision_invalid"]
 
 
 @pytest.mark.parametrize("reason", [None, "", "   "])

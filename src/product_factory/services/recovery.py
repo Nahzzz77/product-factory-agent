@@ -95,7 +95,7 @@ def _collect_validation(root: Path) -> ValidationReport:
     if project is not None:
         _validate_prd(repo, project, findings)
     if state is not None:
-        _validate_workflow_invariants(state, findings)
+        _validate_workflow_invariants(state, findings, project)
 
     _validate_approvals(approvals, state, findings)
     _validate_events(events, project, state, findings)
@@ -166,7 +166,7 @@ def repair_audit(root: Path, lock_id: str, expected_revision: int) -> EventRecor
         # collector deliberately excludes lock status, because this caller is
         # itself the active, validated lease holder.
         report = _collect_validation(root)
-        if not report.findings:
+        if "missing_referenced_event" not in report.findings:
             raise _repair_not_needed()
         if not _only_repairable_audit_gap(report.findings):
             raise _repair_unsafe(report.findings)
@@ -267,7 +267,9 @@ def _validate_prd(repo: ProjectRepository, project: ProjectRecord, findings: lis
         _add(findings, "prd_digest_mismatch")
 
 
-def _validate_workflow_invariants(state: StateRecord, findings: list[str]) -> None:
+def _validate_workflow_invariants(
+    state: StateRecord, findings: list[str], project: ProjectRecord | None = None
+) -> None:
     waiting = state.waiting_on
     expected_gate = {
         WorkflowState.ADAPTATION_PENDING_APPROVAL: GateType.TECHNICAL_ADAPTATION,
@@ -315,6 +317,33 @@ def _validate_workflow_invariants(state: StateRecord, findings: list[str]) -> No
         _add(findings, "workflow_invariant_invalid")
     if state.revision > 0 and state.last_event_id is None:
         _add(findings, "missing_last_event_id")
+    # V1 has one exact reachable state sequence.  This catches hand-edited
+    # records that otherwise satisfy a local completion/evidence combination.
+    v1_revisions = {
+        WorkflowState.INITIALIZED: {0},
+        WorkflowState.INPUTS_CHECKED: {1},
+        WorkflowState.ADAPTATION_PENDING_APPROVAL: {2},
+        WorkflowState.STAGE_DEVELOPMENT: {3},
+        WorkflowState.SYSTEM_VERIFICATION: {4, 5},
+        WorkflowState.HUMAN_ACCEPTANCE_PENDING: {6},
+        WorkflowState.NEXT_STAGE_OR_FRONTEND: {7},
+    }
+    expected_revisions = v1_revisions.get(state.workflow_state)
+    # A state-first crash can leave exactly the next revision and its reserved
+    # event id before the append.  Let the audit collector report that one
+    # repairable gap alone; once the event is present, the same V1 state is an
+    # impossible edited record and is reported below by _validate_events.
+    state_first_audit_gap = (
+        state.workflow_state is WorkflowState.INITIALIZED
+        and state.revision == 1
+        and state.last_event_id is not None
+    )
+    if expected_revisions is not None and state.revision not in expected_revisions and not state_first_audit_gap:
+        _add(findings, "workflow_revision_invalid")
+    if expected_revisions is not None and project is not None:
+        first = project.stage_plan[0]
+        if state.current_stage.id != first.id or state.current_stage.sequence != 1:
+            _add(findings, "workflow_stage_invalid")
 
 
 def _validate_approvals(
@@ -372,6 +401,8 @@ def _validate_events(
     if referenced is None:
         _add(findings, "missing_referenced_event")
         return
+    if state.workflow_state is WorkflowState.INITIALIZED and state.revision == 1:
+        _add(findings, "workflow_revision_invalid")
     if referenced.after_revision != state.revision:
         _add(findings, "referenced_event_revision_mismatch")
     for event in events:

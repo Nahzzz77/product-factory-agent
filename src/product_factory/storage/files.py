@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from product_factory.errors import ErrorCategory, FactoryError
+
 
 _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
 
@@ -29,14 +31,10 @@ def read_contained_regular_bytes(root: Path, parts: tuple[str, ...]) -> bytes:
     """
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("unsafe relative file path")
-    resolved_root = root.resolve()
-    candidate = resolved_root.joinpath(*parts)
     try:
-        resolved_before = candidate.resolve(strict=True)
-        _require_contained(resolved_root, resolved_before)
         if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
-            return _read_posix_contained_file(resolved_root, candidate, parts)
-        return _read_fallback_contained_file(resolved_root, candidate)
+            return _read_posix_contained_file(root, parts)
+        return _read_fallback_contained_file(root, parts)
     except FileNotFoundError:
         # Callers that distinguish an absent optional record (notably the
         # canonical lease) must not have absence confused with malformed data.
@@ -45,16 +43,19 @@ def read_contained_regular_bytes(root: Path, parts: tuple[str, ...]) -> bytes:
         raise ValueError("contained regular file is invalid or changed") from exc
 
 
-def _read_posix_contained_file(root: Path, candidate: Path, parts: tuple[str, ...]) -> bytes:
+def _read_posix_contained_file(root: Path, parts: tuple[str, ...]) -> bytes:
     directory_fd: int | None = None
     file_fd: int | None = None
     try:
-        before = candidate.lstat()
-        if stat.S_ISLNK(before.st_mode):
-            raise ValueError("symlink is not a regular file")
-        _require_contained(root, candidate.resolve(strict=True))
-        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        resolved_root = root.resolve(strict=True)
+        directory_fd = os.open(resolved_root, os.O_RDONLY | os.O_DIRECTORY)
         for part in parts[:-1]:
+            try:
+                before = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError as exc:
+                raise ValueError("parent directory is missing") from exc
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise ValueError("parent is not a real directory")
             next_fd = os.open(
                 part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd
             )
@@ -72,7 +73,9 @@ def _read_posix_contained_file(root: Path, candidate: Path, parts: tuple[str, ..
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("not a regular file")
         content = _read_descriptor(file_fd)
-        _require_path_identity(root, candidate, opened)
+        after = os.stat(parts[-1], dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(after.st_mode) or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("file changed while being read")
         return content
     finally:
         if file_fd is not None:
@@ -81,19 +84,29 @@ def _read_posix_contained_file(root: Path, candidate: Path, parts: tuple[str, ..
             os.close(directory_fd)
 
 
-def _read_fallback_contained_file(root: Path, candidate: Path) -> bytes:
+def _read_fallback_contained_file(root: Path, parts: tuple[str, ...]) -> bytes:
     descriptor: int | None = None
     try:
+        resolved_root = root.resolve(strict=True)
+        candidate = resolved_root
+        for part in parts[:-1]:
+            candidate = candidate / part
+            try:
+                parent = candidate.lstat()
+            except FileNotFoundError as exc:
+                raise ValueError("parent directory is missing") from exc
+            if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+                raise ValueError("parent is not a real directory")
+        candidate = candidate / parts[-1]
         before = candidate.lstat()
         if stat.S_ISLNK(before.st_mode):
             raise ValueError("symlink is not a regular file")
-        _require_contained(root, candidate.resolve(strict=True))
         descriptor = os.open(candidate, _file_read_flags() | getattr(os, "O_NONBLOCK", 0))
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("not a regular file")
         content = _read_descriptor(descriptor)
-        _require_path_identity(root, candidate, opened)
+        _require_path_identity(resolved_root, candidate, opened)
         return content
     finally:
         if descriptor is not None:
@@ -193,22 +206,88 @@ def atomic_write_yaml(path: Path, payload: dict[str, Any]) -> None:
 def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     """Append one complete JSONL record, or preserve the complete previous file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    previous = path.read_bytes() if path.exists() else b""
+    existed, previous = _read_existing_regular_bytes(path)
     line = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    rollback = path.parent / f".{path.name}.{uuid.uuid4().hex}.rollback"
     descriptor: int | None = None
     try:
+        if existed:
+            _write_fsynced_file(rollback, previous)
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         _write_all(descriptor, previous + line)
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = None
         os.replace(temporary, path)
-        _fsync_parent_directory(path)
+        try:
+            _fsync_parent_directory(path)
+        except OSError as original:
+            try:
+                if existed:
+                    os.replace(rollback, path)
+                else:
+                    path.unlink()
+                _fsync_parent_directory(path)
+            except BaseException as rollback_error:
+                raise FactoryError(
+                    "audit_rollback_failed",
+                    ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "审计日志发布失败且无法恢复原记录",
+                    "append_jsonl",
+                    False,
+                    "停止写入并从备份恢复审计日志",
+                    {
+                        "original_errno": original.errno,
+                        "rollback_error": type(rollback_error).__name__,
+                    },
+                ) from rollback_error
+            raise original
     finally:
         if descriptor is not None:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+        # A successfully restored rollback file has already been moved into
+        # place.  This cleanup only removes unused scratch records.
+        rollback.unlink(missing_ok=True)
+
+
+def _write_fsynced_file(path: Path, content: bytes) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_existing_regular_bytes(path: Path) -> tuple[bool, bytes]:
+    """Return an existing JSONL snapshot without following special files."""
+    descriptor: int | None = None
+    try:
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return False, b""
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ValueError("JSONL path is not a regular file")
+        descriptor = os.open(
+            path,
+            _file_read_flags() | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("JSONL path is not a regular file")
+        content = _read_descriptor(descriptor)
+        after = path.lstat()
+        if stat.S_ISLNK(after.st_mode) or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino):
+            raise ValueError("JSONL file changed while being read")
+        return True, content
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _write_all(descriptor: int, content: bytes) -> None:

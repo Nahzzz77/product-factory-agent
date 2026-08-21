@@ -1,10 +1,29 @@
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from product_factory.contracts.identifiers import is_portable_path_component
+from product_factory.contracts.identifiers import (
+    PORTABLE_COMPONENT_PATTERN,
+    PORTABLE_WINDOWS_RESERVED_PATTERN,
+    is_portable_path_component,
+)
+PortableEvidenceId = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=85,
+        pattern=PORTABLE_COMPONENT_PATTERN,
+        json_schema_extra={
+            "allOf": [
+                {"not": {"enum": [".", ".."]}},
+                {"not": {"pattern": r"[.]$"}},
+                {"not": {"pattern": PORTABLE_WINDOWS_RESERVED_PATTERN}},
+            ]
+        },
+    ),
+]
 
 
 class StrictModel(BaseModel):
@@ -164,16 +183,7 @@ class StateRecord(StrictModel):
     workflow_state: WorkflowState
     current_stage: CurrentStage
     waiting_on: WaitingOn | None = None
-    last_valid_evidence_id: str | None = Field(
-        default=None, min_length=1, max_length=255,
-        pattern=r'^[^\\/\x00-\x1f<>:"|?*]+$',
-        json_schema_extra={"x-maxUtf8Bytes": 255, "x-maxUtf16CodeUnits": 255,
-                           "x-normalization": "NFC", "allOf": [
-                               {"not": {"enum": [".", ".."]}},
-                               {"not": {"pattern": r"[. ]$"}},
-                               {"not": {"pattern": r"^(?i:(con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9]|lpt[1-9]))(?:\..*)?$"}},
-                           ]},
-    )
+    last_valid_evidence_id: PortableEvidenceId | None = None
     last_event_id: str | None = None
     updated_at: datetime
 
@@ -245,25 +255,7 @@ class KnownIssue(StrictModel):
 
 class EvidenceManifest(StrictModel):
     schema_version: Literal["1.0"]
-    evidence_id: str = Field(
-        min_length=1,
-        max_length=255,
-        pattern=r'^[^\\/\x00-\x1f<>:"|?*]+$',
-        json_schema_extra={
-            "x-maxUtf8Bytes": 255,
-            "x-maxUtf16CodeUnits": 255,
-            "x-normalization": "NFC",
-            "allOf": [
-                {"not": {"enum": [".", ".."]}},
-                {"not": {"pattern": r"[. ]$"}},
-                {
-                    "not": {
-                        "pattern": r"^(?i:(con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9]|lpt[1-9]))(?:\..*)?$"
-                    }
-                }
-            ]
-        },
-    )
+    evidence_id: PortableEvidenceId
     stage_id: str
     state_revision: int
     factory_version: str

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from product_factory.storage import files
-from product_factory.storage.files import atomic_write_json, contained_path, read_contained_regular_bytes
+from product_factory.storage.files import append_jsonl, atomic_write_json, contained_path, read_contained_regular_bytes
 
 
 def test_atomic_json_leaves_complete_document(tmp_path: Path) -> None:
@@ -181,3 +181,53 @@ def test_fifo_replacement_after_precheck_is_rejected_without_blocking(
     assert not worker.is_alive()
     assert time.monotonic() - started < 1
     assert isinstance(result[0], ValueError)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFO support")
+def test_append_jsonl_rejects_fifo_and_symlinks_without_following(tmp_path: Path) -> None:
+    target = tmp_path / "events.jsonl"
+    os.mkfifo(target)
+    with pytest.raises(ValueError, match="regular file"):
+        append_jsonl(target, {"event": "blocked"})
+
+    target.unlink()
+    outside = tmp_path.parent / "outside-events.jsonl"
+    outside.write_bytes(b"outside\n")
+    target.symlink_to(outside)
+    with pytest.raises(ValueError, match="regular file"):
+        append_jsonl(target, {"event": "blocked"})
+    assert outside.read_bytes() == b"outside\n"
+
+    target.unlink()
+    target.symlink_to(tmp_path / "missing-target")
+    with pytest.raises(ValueError, match="regular file"):
+        append_jsonl(target, {"event": "blocked"})
+
+
+@pytest.mark.parametrize("initial", [b'{"event":"old"}\n', None])
+def test_append_jsonl_rolls_back_after_post_replace_parent_fsync_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial: bytes | None
+) -> None:
+    target = tmp_path / "events.jsonl"
+    if initial is not None:
+        target.write_bytes(initial)
+    calls = 0
+    original = files._fsync_parent_directory
+
+    def fail_once(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        original(path)
+
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_once)
+    with pytest.raises(OSError) as caught:
+        append_jsonl(target, {"event": "new"})
+    assert caught.value.errno == errno.EIO
+    assert target.exists() is (initial is not None)
+    assert target.read_bytes() == initial if initial is not None else not target.exists()
+
+    append_jsonl(target, {"event": "new"})
+    expected = (initial or b"") + b'{"event": "new"}\n'
+    assert target.read_bytes() == expected

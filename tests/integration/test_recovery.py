@@ -11,10 +11,13 @@ from threading import Thread
 
 import pytest
 
-from product_factory.contracts.models import ApprovalRecord, EventRecord, GateType, LockOwner, WaitingOn, WorkflowState
+from product_factory.contracts.models import (
+    ApprovalRecord, CompletionLevel, CurrentStage, EventRecord, GateType, LockOwner, WaitingOn, WorkflowState,
+)
 from product_factory.domain.approvals import APPROVAL_STATEMENT
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.initialize import initialize_project
+from product_factory.storage.files import atomic_write_json
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
@@ -38,6 +41,17 @@ def _root(tmp_path: Path) -> Path:
     prd.write_text("# PRD\n", encoding="utf-8")
     _intake(intake)
     initialize_project(root, "demo-web", "Demo", prd, intake, [("stage-01", "Core", False)], Path.cwd())
+    return root
+
+
+def _two_stage_root(tmp_path: Path) -> Path:
+    prd, intake, root = tmp_path / "prd.md", tmp_path / "intake.yaml", tmp_path / "product"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    _intake(intake)
+    initialize_project(
+        root, "demo-web", "Demo", prd, intake,
+        [("stage-01", "Core", False), ("stage-02", "Frontend", False)], Path.cwd(),
+    )
     return root
 
 
@@ -147,6 +161,34 @@ def test_resume_reports_missing_audit_event_without_repairing(tmp_path: Path) ->
     assert summary.audit_status == "missing_referenced_event"
     assert summary.next_command == "product-factory repair-audit"
     assert _snapshot(root) == before
+
+
+def test_v1_initialized_revision_one_with_a_real_event_is_invalid(tmp_path: Path) -> None:
+    from product_factory.services.recovery import validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state().model_copy(update={"revision": 1, "last_event_id": "event-01"})
+    atomic_write_json(repo.paths.state, state.model_dump(mode="json"))
+    repo.append_event(EventRecord(
+        schema_version="1.0", event_id="event-01", event_type="inputs_checked", project_id=state.project_id,
+        before_revision=0, after_revision=1, created_at=datetime.now(timezone.utc), details={},
+    ))
+    assert "workflow_revision_invalid" in validate_project(root).findings
+
+
+def test_v1_state_must_stay_on_the_first_stage(tmp_path: Path) -> None:
+    from product_factory.services.recovery import validate_project
+
+    root = _two_stage_root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state().model_copy(update={
+        "current_stage": CurrentStage(id="stage-02", sequence=2, completion_level=CompletionLevel.NONE)
+    })
+    atomic_write_json(repo.paths.state, state.model_dump(mode="json"))
+    report = validate_project(root)
+    assert "workflow_stage_invalid" in report.findings
+    assert "current_stage_sequence_mismatch" not in report.findings
 
 
 def test_resume_with_active_lock_recommends_only_status(tmp_path: Path) -> None:
@@ -368,7 +410,9 @@ def test_repair_appends_only_the_referenced_event_and_retries_are_singleton(tmp_
     assert event.event_id == "lost-event"
     assert repo.paths.state.read_bytes() == before_state
     assert [record.event_id for record in repo.read_events()] == ["lost-event"]
-    assert validate_project(root).valid is True
+    report = validate_project(root)
+    assert report.valid is False
+    assert report.findings == ["workflow_revision_invalid"]
     with pytest.raises(FactoryError) as caught:
         repair_audit(root, lock_id, 1)
     assert caught.value.code == "audit_repair_not_needed"

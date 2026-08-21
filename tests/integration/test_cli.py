@@ -200,7 +200,9 @@ def test_cli_repair_audit_lock_takeover_and_rejects_invalid_stage_without_secret
     assert takeover_events[0].details["reason"] == "test recovery"
     assert takeover_events[0].details["old_lock_id"] == lock
     assert takeover_events[0].details["new_lock_id"] == takeover["details"]["lock"]["lock_id"]
-    assert _run_json("validate", "--project", str(root))["details"]["valid"] is True
+    validated = run_cli("--json", "validate", "--project", str(root))
+    assert validated.returncode == 2
+    assert json.loads(validated.stdout)["details"]["findings"] == ["workflow_revision_invalid"]
     _release(root, takeover["details"]["lock"]["lock_id"])
 
 

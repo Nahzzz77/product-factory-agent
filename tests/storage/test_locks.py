@@ -426,6 +426,16 @@ def test_status_rejects_fifo_and_outside_symlink_without_following_or_blocking(t
     assert caught.value.code == "lock_invalid"
 
 
+def test_status_treats_dangling_lock_symlink_as_invalid_not_missing(tmp_path: Path) -> None:
+    manager = LockManager(tmp_path)
+    manager.paths.metadata.mkdir(parents=True)
+    manager.path.symlink_to(tmp_path / "no-such-lock.json")
+
+    with pytest.raises(FactoryError) as caught:
+        manager.status()
+    assert caught.value.code == "lock_invalid"
+
+
 def test_prepared_takeover_audit_failure_preserves_old_lock_before_publication(tmp_path: Path) -> None:
     current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
     manager = LockManager(tmp_path, now_fn=lambda: current[0])
