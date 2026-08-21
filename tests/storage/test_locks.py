@@ -10,8 +10,8 @@ import pytest
 
 from product_factory.contracts.models import LockOwner, LockRecord
 from product_factory.errors import FactoryError
-from product_factory.storage import locks
-from product_factory.storage.files import atomic_write_json
+from product_factory.storage import files, locks
+from product_factory.storage.files import append_jsonl, atomic_write_json
 from product_factory.storage.locks import LockManager
 
 
@@ -452,6 +452,39 @@ def test_prepared_takeover_audit_failure_preserves_old_lock_before_publication(t
         manager.takeover(old.lock_id, owner("new"), 0, "recover", timedelta(minutes=1), prepared=prepared)
     assert manager.path.read_bytes() == old_bytes
     assert manager.status() == old
+
+
+def test_takeover_does_not_publish_lock_when_audit_rollback_presync_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old = manager.acquire(owner("old"), 0, timedelta(seconds=1))
+    old_bytes = manager.path.read_bytes()
+    audit_path = manager.paths.events
+    audit_path.write_bytes(b'{"event":"before"}\n')
+    audit_bytes = audit_path.read_bytes()
+    current[0] += timedelta(seconds=2)
+    original_fsync_parent = files._fsync_parent_directory
+
+    def fail_audit_rollback_presync(path: Path) -> None:
+        if path.name.endswith(".rollback"):
+            raise OSError("audit rollback directory is unavailable")
+        original_fsync_parent(path)
+
+    def prepared(_old: LockRecord):
+        def append_audit(_replacement: LockRecord) -> None:
+            append_jsonl(audit_path, {"event": "takeover"})
+
+        return 0, append_audit
+
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_audit_rollback_presync)
+    with pytest.raises(OSError, match="audit rollback directory is unavailable"):
+        manager.takeover(old.lock_id, owner("new"), 0, "recover", timedelta(minutes=1), prepared=prepared)
+
+    assert manager.path.read_bytes() == old_bytes
+    assert manager.status() == old
+    assert audit_path.read_bytes() == audit_bytes
 
 
 def test_mutex_is_released_when_holder_process_is_terminated(tmp_path: Path) -> None:

@@ -216,7 +216,15 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     try:
         if existed:
             _write_fsynced_file(rollback, previous)
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # The rollback name must itself be durable before we begin writing
+            # the new canonical candidate.  Otherwise a crash after changing
+            # ``path`` could leave neither durable version available.
+            _fsync_parent_directory(rollback)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         _write_all(descriptor, previous + line)
         os.fsync(descriptor)
         os.close(descriptor)
@@ -312,7 +320,11 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
 def _write_fsynced_file(path: Path, content: bytes) -> None:
     descriptor: int | None = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
         _write_all(descriptor, content)
         os.fsync(descriptor)
     finally:

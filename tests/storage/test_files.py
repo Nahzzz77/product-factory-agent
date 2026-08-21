@@ -205,6 +205,137 @@ def test_append_jsonl_rejects_fifo_and_symlinks_without_following(tmp_path: Path
         append_jsonl(target, {"event": "blocked"})
 
 
+def test_append_jsonl_uses_binary_content_flags_and_preserves_raw_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "events.jsonl"
+    previous = b'{"event":"old"}\r\n'
+    target.write_bytes(previous)
+    binary_flag = 0x40000000
+    original_open = files.os.open
+    opened: list[tuple[object, int]] = []
+
+    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        opened.append((path, flags))
+        # The host is not Windows, so remove our simulated Windows-only flag
+        # before delegating to the real kernel.
+        return original_open(path, flags & ~binary_flag, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "name", "nt")
+    monkeypatch.setattr(files.os, "O_BINARY", binary_flag, raising=False)
+    monkeypatch.setattr(files.os, "open", spy_open)
+
+    append_jsonl(target, {"event": "new"})
+
+    assert target.read_bytes() == previous + b'{"event": "new"}\n'
+    assert b"\r\r\n" not in target.read_bytes()
+    rollback_flags = [flags for path, flags in opened if str(path).endswith(".rollback")]
+    temporary_flags = [flags for path, flags in opened if str(path).endswith(".tmp")]
+    directory_flags = [flags for path, flags in opened if path == target.parent]
+    assert len(rollback_flags) == len(temporary_flags) == 1
+    assert rollback_flags[0] & binary_flag
+    assert temporary_flags[0] & binary_flag
+    assert directory_flags and all(not (flags & binary_flag) for flags in directory_flags)
+
+
+def test_write_fsynced_file_preserves_special_raw_bytes_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "rollback.bin"
+    payload = b"CRLF\r\ncontrol\x1a\xff\x00\n"
+    binary_flag = 0x40000000
+    original_open = files.os.open
+    opened_flags: list[int] = []
+
+    def spy_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        opened_flags.append(flags)
+        return original_open(path, flags & ~binary_flag, *args, **kwargs)
+
+    monkeypatch.setattr(files.os, "name", "nt")
+    monkeypatch.setattr(files.os, "O_BINARY", binary_flag, raising=False)
+    monkeypatch.setattr(files.os, "open", spy_open)
+
+    files._write_fsynced_file(target, payload)
+
+    assert target.read_bytes() == payload
+    assert opened_flags == [files.os.O_WRONLY | files.os.O_CREAT | files.os.O_EXCL | binary_flag]
+
+
+def test_append_jsonl_durably_saves_rollback_before_canonical_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "events.jsonl"
+    target.write_bytes(b'{"event":"old"}\n')
+    sequence: list[str] = []
+    original_write = files._write_fsynced_file
+    original_open = files.os.open
+    original_replace = files.os.replace
+    original_fsync_parent = files._fsync_parent_directory
+
+    def track_rollback_write(path: Path, content: bytes) -> None:
+        assert path.name.endswith(".rollback")
+        sequence.append("write rollback")
+        original_write(path, content)
+
+    def track_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path).endswith(".tmp"):
+            sequence.append("write new temp")
+        return original_open(path, flags, *args, **kwargs)
+
+    def track_replace(source: object, destination: object) -> None:
+        if str(source).endswith(".tmp") and destination == target:
+            sequence.append("replace canonical")
+        original_replace(source, destination)
+
+    def track_fsync_parent(path: Path) -> None:
+        if path.name.endswith(".rollback"):
+            sequence.append("pre-fsync rollback parent")
+        elif path == target:
+            sequence.append("publish fsync")
+        original_fsync_parent(path)
+
+    monkeypatch.setattr(files, "_write_fsynced_file", track_rollback_write)
+    monkeypatch.setattr(files.os, "open", track_open)
+    monkeypatch.setattr(files.os, "replace", track_replace)
+    monkeypatch.setattr(files, "_fsync_parent_directory", track_fsync_parent)
+
+    append_jsonl(target, {"event": "new"})
+
+    assert sequence == [
+        "write rollback",
+        "pre-fsync rollback parent",
+        "write new temp",
+        "replace canonical",
+        "publish fsync",
+    ]
+
+
+def test_append_jsonl_pre_rollback_sync_failure_leaves_canonical_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "events.jsonl"
+    previous = b'{"event":"old"}\r\n'
+    target.write_bytes(previous)
+    original_fsync_parent = files._fsync_parent_directory
+    calls: list[Path] = []
+
+    def fail_rollback_sync(path: Path) -> None:
+        calls.append(path)
+        if path.name.endswith(".rollback"):
+            raise OSError(errno.EIO, "injected rollback parent fsync failure")
+        original_fsync_parent(path)
+
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_rollback_sync)
+    with pytest.raises(OSError) as caught:
+        append_jsonl(target, {"event": "new"})
+
+    assert caught.value.errno == errno.EIO
+    assert target.read_bytes() == previous
+    assert not list(tmp_path.glob("*.tmp"))
+    assert not list(tmp_path.glob("*.rollback"))
+    assert len(calls) == 1 and calls[0].name.endswith(".rollback")
+
+
 @pytest.mark.parametrize("initial", [b'{"event":"old"}\n', None])
 def test_append_jsonl_rolls_back_after_post_replace_parent_fsync_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, initial: bytes | None
@@ -215,14 +346,16 @@ def test_append_jsonl_rolls_back_after_post_replace_parent_fsync_failure(
     calls = 0
     original = files._fsync_parent_directory
 
-    def fail_once(path: Path) -> None:
+    def fail_publish_sync(path: Path) -> None:
         nonlocal calls
         calls += 1
-        if calls == 1:
+        # Existing logs pre-sync the rollback directory before publishing;
+        # fresh logs have no rollback and publish on their first sync.
+        if calls == (2 if initial is not None else 1):
             raise OSError(errno.EIO, "injected parent fsync failure")
         original(path)
 
-    monkeypatch.setattr(files, "_fsync_parent_directory", fail_once)
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_publish_sync)
     with pytest.raises(OSError) as caught:
         append_jsonl(target, {"event": "new"})
     assert caught.value.errno == errno.EIO
@@ -244,18 +377,19 @@ def test_append_jsonl_preserves_rollback_scratch_when_restore_replace_fails(
     original_fsync_parent = files._fsync_parent_directory
     parent_fsync_calls = 0
 
-    def fail_first_parent_fsync(path: Path) -> None:
+    def fail_publish_parent_fsync(path: Path) -> None:
         nonlocal parent_fsync_calls
         parent_fsync_calls += 1
-        if parent_fsync_calls == 1:
+        if parent_fsync_calls == 2:
             raise OSError(errno.EIO, "injected publish fsync failure")
+        original_fsync_parent(path)
 
     def deny_rollback_replace(source: object, destination: object) -> None:
         if str(source).endswith(".rollback"):
             raise OSError(errno.EACCES, "injected rollback replace denial")
         original_replace(source, destination)
 
-    monkeypatch.setattr(files, "_fsync_parent_directory", fail_first_parent_fsync)
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_publish_parent_fsync)
     monkeypatch.setattr(files.os, "replace", deny_rollback_replace)
 
     with pytest.raises(FactoryError) as caught:
@@ -283,10 +417,17 @@ def test_append_jsonl_reports_restored_but_unsynced_rollback(
     old = b'{"event":"old"}\n'
     target.write_bytes(old)
 
-    def fail_every_parent_fsync(path: Path) -> None:
-        raise OSError(errno.EIO, "injected parent fsync failure")
+    original_fsync_parent = files._fsync_parent_directory
+    parent_fsync_calls = 0
 
-    monkeypatch.setattr(files, "_fsync_parent_directory", fail_every_parent_fsync)
+    def fail_publish_and_rollback_parent_fsync(path: Path) -> None:
+        nonlocal parent_fsync_calls
+        parent_fsync_calls += 1
+        if parent_fsync_calls >= 2:
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        original_fsync_parent(path)
+
+    monkeypatch.setattr(files, "_fsync_parent_directory", fail_publish_and_rollback_parent_fsync)
     with pytest.raises(FactoryError) as caught:
         append_jsonl(target, {"event": "new"})
 
