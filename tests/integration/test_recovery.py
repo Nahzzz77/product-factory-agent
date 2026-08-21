@@ -223,6 +223,76 @@ def test_resume_reports_unverifiable_evidence_without_mutation_guidance(
     assert summary.next_command == "product-factory validate"
 
 
+def test_recovery_classifies_retryable_environment_digest_error_as_unverifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from product_factory.services import recovery
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    project, state = repo.load_project(), repo.load_state()
+    repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "wanted"}), 0)
+    path = repo.evidence_path("stage-01", "wanted")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "evidence_id": "wanted", "stage_id": "stage-01", "state_revision": 1,
+        "factory_version": project.factory_version, "prd_sha256": project.prd.sha256, "source_digest": "a" * 64,
+        "checks": [{"name": "check", "command": "true", "started_at": "2026-08-20T00:00:00Z", "ended_at": "2026-08-20T00:00:01Z", "exit_status": 0, "summary": "ok", "mode": "mock"}],
+        "ready_for_human_acceptance": True,
+    }), encoding="utf-8")
+    error = FactoryError(
+        "source_digest_unstable", ErrorCategory.ENVIRONMENT_BLOCKED, "source changed during digest",
+        "validate", True, "retry validation after source activity stops",
+    )
+    monkeypatch.setattr(
+        recovery,
+        "compute_source_digest",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+
+    report = recovery.validate_project(root)
+    summary = recovery.resume_project(root)
+
+    assert "referenced_evidence_unverifiable" in report.findings
+    assert summary.evidence_status == "unverifiable"
+    assert summary.next_command == "product-factory validate"
+
+
+def test_recovery_classifies_unknown_factory_digest_error_as_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from product_factory.services import recovery
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    project, state = repo.load_project(), repo.load_state()
+    repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "wanted"}), 0)
+    path = repo.evidence_path("stage-01", "wanted")
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "schema_version": "1.0", "evidence_id": "wanted", "stage_id": "stage-01", "state_revision": 1,
+        "factory_version": project.factory_version, "prd_sha256": project.prd.sha256, "source_digest": "a" * 64,
+        "checks": [{"name": "check", "command": "true", "started_at": "2026-08-20T00:00:00Z", "ended_at": "2026-08-20T00:00:01Z", "exit_status": 0, "summary": "ok", "mode": "mock"}],
+        "ready_for_human_acceptance": True,
+    }), encoding="utf-8")
+    error = FactoryError(
+        "digest_contract_invalid", ErrorCategory.IMPLEMENTATION_FAILED, "digest protocol violated",
+        "validate", False, "inspect the evidence digest implementation",
+    )
+    monkeypatch.setattr(
+        recovery,
+        "compute_source_digest",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+
+    report = recovery.validate_project(root)
+    summary = recovery.resume_project(root)
+
+    assert "referenced_evidence_invalid" in report.findings
+    assert summary.evidence_status == "invalid"
+    assert summary.next_command == "product-factory validate"
+
+
 def test_recovery_marks_invalid_evidence_identifier_as_invalid(tmp_path: Path) -> None:
     from product_factory.services.recovery import resume_project, validate_project
 
