@@ -18,6 +18,14 @@ python3 -m venv .venv
 
 ## 推荐用法：本地 Web 工作台
 
+### 双击启动（macOS）
+
+在 Finder 中打开本项目文件夹，双击 `启动产品工厂.command`。它会自动启动本地服务并打开浏览器，项目默认保存到 `~/ProductFactoryProjects`。关闭对应的终端窗口即可停止工作台。
+
+macOS 首次可能会阻止未签名脚本。可在 Finder 中右键该文件，选择“打开”并确认。
+
+### 命令行启动
+
 安装后运行：
 
 ```bash
