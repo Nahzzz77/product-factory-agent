@@ -2,7 +2,9 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from product_factory.domain.approvals import APPROVAL_STATEMENT
@@ -190,3 +192,92 @@ def test_cli_repair_audit_lock_takeover_and_rejects_invalid_stage_without_secret
     )
     assert takeover["details"]["takeover"]["old_lock_id"] == lock
     _release(root, takeover["details"]["lock"]["lock_id"])
+
+
+def test_json_argument_error_is_a_safe_protocol_envelope() -> None:
+    result = run_cli("--json", "status", "--project")
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert result.stderr == ""
+    assert list(payload) == [
+        "ok", "code", "category", "message", "step", "retryable", "action", "details"
+    ]
+    assert payload["code"] == "argument_invalid"
+    assert payload["category"] == "input_required"
+
+
+def test_human_argument_error_does_not_print_argparse_usage() -> None:
+    result = run_cli("status", "--project")
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.startswith("未完成：")
+    assert "usage:" not in result.stderr
+
+
+def test_approve_rejects_bad_preflight_without_reading_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from product_factory.cli.main import main
+
+    def unexpected_input(*_args, **_kwargs):
+        raise AssertionError("stdin must not be read before approval preflight")
+
+    monkeypatch.setattr("builtins.input", unexpected_input)
+    exit_code = main([
+        "--json", "approve", "--project", str(tmp_path / "uninitialized"), "--actor", "owner",
+        "--lock-id", "not-a-lock", "--expected-revision", "0",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["code"] == "project_not_initialized"
+
+    prd, intake, root = tmp_path / "prd.md", tmp_path / "intake.yaml", tmp_path / "initialized"
+    prd.write_text("# PRD\n", encoding="utf-8")
+    _intake(intake)
+    assert main([
+        "--json", "init", "--project", str(root), "--project-id", "demo-web", "--name", "Demo",
+        "--prd", str(prd), "--intake", str(intake), "--stage", "stage-01:Core",
+    ]) == 0
+    capsys.readouterr()
+    exit_code = main([
+        "--json", "approve", "--project", str(root), "--actor", "owner",
+        "--lock-id", "not-a-lock", "--expected-revision", "0",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 4
+    assert payload["code"] == "lock_required"
+
+
+def test_cli_protocolizes_validation_internal_and_interrupt_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from product_factory.cli import main as cli_main
+
+    monkeypatch.setattr(
+        cli_main, "validate_project", lambda _root: SimpleNamespace(valid=False, findings=["state_invalid"])
+    )
+    exit_code = cli_main.main(["--json", "validate", "--project", "."])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["code"] == "validation_failed"
+    assert payload["details"] == {"findings": ["state_invalid"]}
+
+    def internal(_args):
+        raise RuntimeError("TEST_SECRET_DO_NOT_PRINT")
+
+    monkeypatch.setattr(cli_main, "_dispatch", internal)
+    exit_code = cli_main.main(["--json", "status", "--project", "."])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 10
+    assert payload["category"] == "implementation_failed"
+    assert "TEST_SECRET_DO_NOT_PRINT" not in json.dumps(payload)
+
+    def interrupted(_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main, "_dispatch", interrupted)
+    exit_code = cli_main.main(["--json", "status", "--project", "."])
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 10
+    assert payload["code"] == "interrupted"
+    assert payload["category"] == "interrupted"

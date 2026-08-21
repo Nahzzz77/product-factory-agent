@@ -5,15 +5,16 @@ from __future__ import annotations
 import os
 import socket
 import sys
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from datetime import timedelta
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, Sequence
 
 from pydantic import ValidationError
 
 from product_factory.cli.output import failure, internal_failure, render, success
-from product_factory.cli.parser import build_parser
+from product_factory.cli.parser import ArgumentParseError, build_parser
 from product_factory.contracts.models import GateType, LockOwner
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.evidence import record_evidence, verify_stage
@@ -26,38 +27,46 @@ from product_factory.storage.repository import ProjectRepository
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run one command, exposing only protocol-safe outcome data."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # This pre-parse check is intentionally only a mode selector.  It never
+    # includes argv text in an error envelope, so malformed secret-bearing
+    # arguments cannot be reflected by argparse diagnostics.
+    json_mode = "--json" in arguments
     parser = build_parser()
-    namespace = parser.parse_args(argv)
     try:
+        namespace = parser.parse_args(arguments)
         envelope = _dispatch(namespace)
+    except ArgumentParseError:
+        envelope = failure(_argument_error())
+        return _emit(envelope, json_mode, 2)
+    except KeyboardInterrupt:
+        envelope = failure(_interrupted_error())
+        return _emit(envelope, json_mode, _interrupted_error().exit_code)
     except FactoryError as error:
         envelope = failure(error)
-        _write(envelope, namespace.json_mode)
-        return error.exit_code
+        return _emit(envelope, json_mode, error.exit_code)
     except Exception:
         # Unexpected exceptions may contain source paths, environment values, or
         # library diagnostics.  They are intentionally not terminal output.
         envelope = internal_failure()
-        _write(envelope, namespace.json_mode)
-        return 1
-    _write(envelope, namespace.json_mode)
-    return 0
+        return _emit(envelope, json_mode, 10)
+    return _emit(envelope, json_mode, 0)
 
 
 def _dispatch(args: Any):
     root = Path(args.project)
     if args.command == "init":
-        state = initialize_project(
-            target=root,
-            project_id=args.project_id,
-            name=args.name,
-            # Resolve CLI input paths from the caller's current directory;
-            # initialization still reads the bundled handbook manifest below.
-            prd_source=Path(args.prd).resolve(),
-            intake_source=Path(args.intake).resolve(),
-            stage_specs=[_parse_stage(value) for value in args.stage],
-            factory_root=_factory_root(),
-        )
+        with _factory_root() as factory_root:
+            state = initialize_project(
+                target=root,
+                project_id=args.project_id,
+                name=args.name,
+                # Resolve CLI input paths from the caller's current directory.
+                prd_source=Path(args.prd).resolve(),
+                intake_source=Path(args.intake).resolve(),
+                stage_specs=[_parse_stage(value) for value in args.stage],
+                factory_root=factory_root,
+            )
         return success("initialized", "项目已初始化", "运行 check-inputs", {"state": state})
 
     if args.command == "check-inputs":
@@ -79,8 +88,13 @@ def _dispatch(args: Any):
         return success("approval_requested", "已请求人工审批", "运行 approve 并输入协议批准语句", {"state": state})
 
     if args.command == "approve":
+        _repository_or_error(root, "approve")
+        service = WorkflowService(root)
+        # Validate the project and lease before asking a human for a statement.
+        # The service rechecks this whole boundary after input for TOCTOU safety.
+        service.prepare_approval(args.lock_id, args.expected_revision)
         statement = _read_approval_statement(args.json_mode)
-        state = WorkflowService(root).approve(statement, args.actor, args.lock_id, args.expected_revision)
+        state = service.approve(statement, args.actor, args.lock_id, args.expected_revision)
         return success("approval_consumed", "审批已记录并消费", "继续下一项工作流操作", {"state": state})
 
     if args.command == "record-evidence":
@@ -102,10 +116,12 @@ def _dispatch(args: Any):
 
     if args.command == "validate":
         report = validate_project(root)
-        code = "validation_passed" if report.valid else "validation_failed"
-        message = "项目协议记录有效" if report.valid else "项目协议记录存在问题"
-        action = "继续当前工作流" if report.valid else "根据 findings 修复后重新验证"
-        return success(code, message, action, {"valid": report.valid, "findings": report.findings})
+        if not report.valid:
+            raise FactoryError(
+                "validation_failed", ErrorCategory.INPUT_REQUIRED, "项目协议记录存在问题",
+                "validate", False, "根据 findings 修复后重新验证", {"findings": report.findings},
+            )
+        return success("validation_passed", "项目协议记录有效", "继续当前工作流", {"valid": True, "findings": []})
 
     if args.command == "repair-audit":
         event = repair_audit(root, args.lock_id, args.expected_revision)
@@ -204,15 +220,62 @@ def _read_approval_statement(json_mode: bool) -> str:
             "approval_statement_required", ErrorCategory.APPROVAL_REQUIRED, "必须交互式输入批准语句",
             "approve", True, "重新运行 approve 并输入完整批准语句",
         ) from exc
+    except KeyboardInterrupt as exc:
+        raise _interrupted_error() from exc
 
 
-def _factory_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+@contextmanager
+def _factory_root():
+    """Materialize package-owned handbooks without assuming an installed path."""
+    resource_root = files("product_factory").joinpath("resources")
+    if resource_root.is_dir():
+        with as_file(resource_root) as root:
+            yield root
+        return
+    # Editable source runs retain a development-only fallback.  Installed wheels
+    # never depend on the caller's working directory because they carry resources.
+    source_root = Path.cwd()
+    if (source_root / "references/handbooks/manifest.yaml").is_file():
+        yield source_root
+        return
+    raise FactoryError(
+        "handbook_invalid", ErrorCategory.INPUT_REQUIRED, "技术手册资源不可读取",
+        "init", False, "重新安装包含技术手册的 product-factory 包",
+    )
 
 
-def _write(envelope: Any, json_mode: bool) -> None:
+def _argument_error() -> FactoryError:
+    return FactoryError(
+        "argument_invalid", ErrorCategory.INPUT_REQUIRED, "命令参数无效", "arguments", False,
+        "运行 product-factory --help 查看命令用法",
+    )
+
+
+def _interrupted_error() -> FactoryError:
+    return FactoryError(
+        "interrupted", ErrorCategory.INTERRUPTED, "操作已中断", "interrupted", True,
+        "确认当前状态后重新运行命令",
+    )
+
+
+def _emit(envelope: Any, json_mode: bool, exit_code: int) -> int:
+    return exit_code if _write(envelope, json_mode) else 0
+
+
+def _write(envelope: Any, json_mode: bool) -> bool:
     destination = sys.stdout if json_mode or envelope.ok else sys.stderr
-    print(render(envelope, json_mode), end="", file=destination)
+    try:
+        destination.write(render(envelope, json_mode))
+        destination.flush()
+        return True
+    except BrokenPipeError:
+        # Replacing stdout prevents the interpreter's final flush from emitting
+        # ``Exception ignored`` after a consumer (for example `head`) closes.
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        except OSError:
+            pass
+        return False
 
 
 if __name__ == "__main__":

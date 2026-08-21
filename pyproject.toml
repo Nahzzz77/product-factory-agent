@@ -22,6 +22,9 @@ product-factory-export-schemas = "product_factory.contracts.export:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/product_factory"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"references" = "product_factory/resources/references"
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]

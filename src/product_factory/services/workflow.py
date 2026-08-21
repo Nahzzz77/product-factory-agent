@@ -183,6 +183,36 @@ class WorkflowService:
                 event_id=event_id,
             )
 
+    def prepare_approval(self, lock_id: str, expected_revision: int) -> None:
+        """Check whether approval can be requested without consuming stdin.
+
+        The CLI calls this short, non-mutating preflight before prompting the
+        operator.  ``approve`` deliberately repeats every check after input,
+        because the lock may have expired or project files may have changed in
+        the meantime.
+        """
+        with self.locks.mutation(lock_id, expected_revision):
+            repo = ProjectRepository(self.root)
+            project, current = self._context(repo, expected_revision, "approve")
+            waiting = current.waiting_on
+            if waiting is None:
+                raise self._error(
+                    "approval_not_pending", "当前没有待消费的审批", "approve",
+                    category=ErrorCategory.APPROVAL_REQUIRED,
+                )
+            self._require_scope_unchanged(repo, project, current, waiting)
+            target = {
+                GateType.TECHNICAL_ADAPTATION: WorkflowState.STAGE_DEVELOPMENT,
+                GateType.STAGE_ACCEPTANCE: WorkflowState.NEXT_STAGE_OR_FRONTEND,
+            }[waiting.gate_type]
+            require_transition(
+                current.workflow_state,
+                target,
+                current.current_stage.completion_level,
+                has_approval=True,
+                has_valid_evidence=current.last_valid_evidence_id is not None,
+            )
+
     def start_verification(self, lock_id: str, expected_revision: int) -> StateRecord:
         """Record completed implementation before evidence is authored and validated."""
         with self.locks.mutation(lock_id, expected_revision):

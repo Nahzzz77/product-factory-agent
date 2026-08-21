@@ -5,10 +5,24 @@ from __future__ import annotations
 import argparse
 
 
+class ArgumentParseError(Exception):
+    """A deliberately detail-free parse failure for the public CLI boundary."""
+
+
+class ProtocolArgumentParser(argparse.ArgumentParser):
+    """Do not let argparse echo untrusted arguments or terminate the process."""
+
+    def error(self, message: str) -> None:
+        del message
+        raise ArgumentParseError
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="product-factory", description="产品工厂交付协议命令行")
+    parser = ProtocolArgumentParser(prog="product-factory", description="产品工厂交付协议命令行")
     parser.add_argument("--json", action="store_true", dest="json_mode", help="输出稳定的 JSON 结果")
-    commands = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(
+        dest="command", required=True, parser_class=ProtocolArgumentParser
+    )
 
     init = commands.add_parser("init", help="初始化一个新的受管项目")
     _project(init, required=True)

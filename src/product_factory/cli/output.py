@@ -32,7 +32,7 @@ def failure(error: FactoryError) -> ResultEnvelope:
 
 def internal_failure() -> ResultEnvelope:
     return ResultEnvelope(
-        ok=False, code="internal_error", category="internal_error", message="命令未能安全完成",
+        ok=False, code="internal_error", category="implementation_failed", message="命令未能安全完成",
         step="internal", retryable=False, action="检查本地受控日志或联系维护者", details={},
     )
 
