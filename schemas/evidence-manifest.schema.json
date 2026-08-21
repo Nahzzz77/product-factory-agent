@@ -116,7 +116,7 @@
         },
         {
           "not": {
-            "pattern": "^(?i:(con|prn|aux|nul|com[1-9]|lpt[1-9]))(?:\\..*)?$"
+            "pattern": "^(?i:(con|prn|aux|nul|conin\\$|conout\\$|clock\\$|com[1-9]|lpt[1-9]))(?:\\..*)?$"
           }
         }
       ],
@@ -124,7 +124,10 @@
       "minLength": 1,
       "pattern": "^[^\\\\/\\x00-\\x1f<>:\"|?*]+$",
       "title": "Evidence Id",
-      "type": "string"
+      "type": "string",
+      "x-maxUtf16CodeUnits": 255,
+      "x-maxUtf8Bytes": 255,
+      "x-normalization": "NFC"
     },
     "factory_version": {
       "title": "Factory Version",

@@ -180,12 +180,18 @@ def test_pending_approval_written_before_state_commit_is_a_valid_resume_point(tm
         type="approval", request_id="request-01", gate_type=GateType.TECHNICAL_ADAPTATION,
         scope={"artifact": "docs/technical-adaptation.md"},
     )
-    revision_one = current.model_copy(update={"revision": 1})
+    revision_one = current.model_copy(update={"revision": 1, "last_event_id": "event-01"})
     repo.save_state(revision_one, 0)
     pending = revision_one.model_copy(update={
         "revision": 2, "workflow_state": WorkflowState.ADAPTATION_PENDING_APPROVAL, "waiting_on": waiting,
+        "last_event_id": "event-02",
     })
     repo.save_state(pending, 1)
+    repo.append_event(EventRecord(
+        schema_version="1.0", event_id="event-02", event_type="approval_requested",
+        project_id=pending.project_id, before_revision=1, after_revision=2,
+        created_at=datetime.now(timezone.utc), details={},
+    ))
     repo.append_approval(ApprovalRecord(
         schema_version="1.0", approval_id="approval-01", request_id=waiting.request_id,
         gate_type=waiting.gate_type, scope=waiting.scope, state_revision=2,
@@ -342,7 +348,7 @@ def test_recovery_marks_invalid_evidence_identifier_as_invalid(tmp_path: Path) -
     repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "../escape"}), 0)
 
     report = validate_project(root)
-    assert "referenced_evidence_invalid" in report.findings
+    assert "state_invalid" in report.findings
     assert "referenced_evidence_unverifiable" not in report.findings
     summary = resume_project(root)
     assert summary.evidence_status == "invalid"

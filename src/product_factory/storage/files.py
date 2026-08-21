@@ -37,6 +37,10 @@ def read_contained_regular_bytes(root: Path, parts: tuple[str, ...]) -> bytes:
         if os.name != "nt" and hasattr(os, "O_NOFOLLOW"):
             return _read_posix_contained_file(resolved_root, candidate, parts)
         return _read_fallback_contained_file(resolved_root, candidate)
+    except FileNotFoundError:
+        # Callers that distinguish an absent optional record (notably the
+        # canonical lease) must not have absence confused with malformed data.
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError("contained regular file is invalid or changed") from exc
 

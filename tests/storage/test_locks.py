@@ -400,6 +400,50 @@ def test_status_is_read_only_and_reads_a_legacy_canonical_lock(tmp_path: Path) -
     assert not manager.mutex_path.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="mkfifo is a POSIX probe")
+def test_status_rejects_fifo_and_outside_symlink_without_following_or_blocking(tmp_path: Path) -> None:
+    manager = LockManager(tmp_path)
+    manager.paths.metadata.mkdir(parents=True)
+    os.mkfifo(manager.path)
+    result: list[object] = []
+    def check_fifo() -> None:
+        try:
+            manager.status()
+        except FactoryError as error:
+            result.append(error)
+    worker = Thread(target=check_fifo)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert isinstance(result[0], FactoryError) and result[0].code == "lock_invalid"
+
+    manager.path.unlink()
+    outside = tmp_path.parent / "outside-lock.json"
+    atomic_write_json(outside, manager._new_record(owner("outside"), 0, timedelta(minutes=1)).model_dump(mode="json"))
+    manager.path.symlink_to(outside)
+    with pytest.raises(FactoryError, match="执行锁文件无效") as caught:
+        manager.status()
+    assert caught.value.code == "lock_invalid"
+
+
+def test_prepared_takeover_audit_failure_preserves_old_lock_before_publication(tmp_path: Path) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old = manager.acquire(owner("old"), 0, timedelta(seconds=1))
+    old_bytes = manager.path.read_bytes()
+    current[0] += timedelta(seconds=2)
+
+    def prepared(_old: LockRecord):
+        def fail(_replacement: LockRecord) -> None:
+            raise OSError("audit storage unavailable")
+        return 7, fail
+
+    with pytest.raises(OSError, match="audit storage unavailable"):
+        manager.takeover(old.lock_id, owner("new"), 0, "recover", timedelta(minutes=1), prepared=prepared)
+    assert manager.path.read_bytes() == old_bytes
+    assert manager.status() == old
+
+
 def test_mutex_is_released_when_holder_process_is_terminated(tmp_path: Path) -> None:
     source_root = Path(__file__).parents[2] / "src"
     script = "\n".join(

@@ -164,9 +164,24 @@ class StateRecord(StrictModel):
     workflow_state: WorkflowState
     current_stage: CurrentStage
     waiting_on: WaitingOn | None = None
-    last_valid_evidence_id: str | None = None
+    last_valid_evidence_id: str | None = Field(
+        default=None, min_length=1, max_length=255,
+        pattern=r'^[^\\/\x00-\x1f<>:"|?*]+$',
+        json_schema_extra={"x-maxUtf8Bytes": 255, "x-maxUtf16CodeUnits": 255,
+                           "x-normalization": "NFC", "allOf": [
+                               {"not": {"enum": [".", ".."]}},
+                               {"not": {"pattern": r"[. ]$"}},
+                               {"not": {"pattern": r"^(?i:(con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9]|lpt[1-9]))(?:\..*)?$"}},
+                           ]},
+    )
     last_event_id: str | None = None
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def require_portable_evidence_reference(self):
+        if self.last_valid_evidence_id is not None and not is_portable_path_component(self.last_valid_evidence_id):
+            raise ValueError("last_valid_evidence_id must be a portable path component")
+        return self
 
 
 class ApprovalRecord(StrictModel):
@@ -235,12 +250,15 @@ class EvidenceManifest(StrictModel):
         max_length=255,
         pattern=r'^[^\\/\x00-\x1f<>:"|?*]+$',
         json_schema_extra={
+            "x-maxUtf8Bytes": 255,
+            "x-maxUtf16CodeUnits": 255,
+            "x-normalization": "NFC",
             "allOf": [
                 {"not": {"enum": [".", ".."]}},
                 {"not": {"pattern": r"[. ]$"}},
                 {
                     "not": {
-                        "pattern": r"^(?i:(con|prn|aux|nul|com[1-9]|lpt[1-9]))(?:\..*)?$"
+                        "pattern": r"^(?i:(con|prn|aux|nul|conin\$|conout\$|clock\$|com[1-9]|lpt[1-9]))(?:\..*)?$"
                     }
                 }
             ]
@@ -261,6 +279,8 @@ class EvidenceManifest(StrictModel):
         if not is_portable_path_component(self.evidence_id):
             raise ValueError("evidence_id must be a portable path component")
         return self
+
+
 
 
 class ResultEnvelope(StrictModel):

@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from product_factory.contracts.models import LockOwner, LockRecord
 from product_factory.errors import ErrorCategory, FactoryError
-from product_factory.storage.files import _fsync_parent_directory, atomic_write_json
+from product_factory.storage.files import _fsync_parent_directory, atomic_write_json, read_contained_regular_bytes
 from product_factory.storage.paths import ProjectPaths
 
 
@@ -60,10 +60,10 @@ class LockManager:
     def status(self) -> LockRecord | None:
         """Read only the canonical JSON lock; this never creates a sidecar."""
         try:
-            content = self.path.read_text(encoding="utf-8")
+            content = read_contained_regular_bytes(self.paths.root, self.path.relative_to(self.paths.root).parts)
         except FileNotFoundError:
             return None
-        except UnicodeDecodeError as exc:
+        except (UnicodeDecodeError, ValueError) as exc:
             raise FactoryError(
                 "lock_invalid",
                 ErrorCategory.ENVIRONMENT_BLOCKED,
@@ -172,7 +172,7 @@ class LockManager:
         reason: str,
         lease: timedelta,
         *,
-        on_committed: Callable[[LockRecord, LockRecord, str], None] | None = None,
+        prepared: Callable[[LockRecord], tuple[int, Callable[[LockRecord], None]]] | None = None,
     ) -> TakeoverResult:
         self._require_positive_lease(lease)
         if not reason.strip():
@@ -226,14 +226,16 @@ class LockManager:
                     True,
                     "等待租约过期或让原持有者释放",
                 )
+            # A prepared takeover loads protocol state and writes its truthful
+            # write-ahead audit before the canonical lock is replaced.  Thus an
+            # audit failure leaves both old lock bytes and lock identity intact.
+            audit: Callable[[LockRecord], None] | None = None
+            if prepared is not None:
+                state_revision, audit = prepared(old)
             replacement = self._new_record(owner, state_revision, lease)
+            if audit is not None:
+                audit(replacement)
             self._replace_expired_lock(replacement)
-            # The callback deliberately runs before the SQLite transaction is
-            # released.  CLI audit appends therefore cannot be interleaved with
-            # any other protocol mutation.  Its own business I/O errors retain
-            # their original type and are never translated into mutex failures.
-            if on_committed is not None:
-                on_committed(old, replacement, reason)
             return TakeoverResult(
                 lock=replacement,
                 details={

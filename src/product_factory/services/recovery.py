@@ -14,6 +14,7 @@ from pydantic import BaseModel, ValidationError
 
 from product_factory.contracts.models import (
     ApprovalRecord,
+    CompletionLevel,
     EventRecord,
     GateType,
     IntakeRecord,
@@ -277,6 +278,43 @@ def _validate_workflow_invariants(state: StateRecord, findings: list[str]) -> No
             _add(findings, "waiting_on_invalid_for_workflow_state")
     elif waiting is None or waiting.gate_type is not expected_gate:
         _add(findings, "waiting_on_gate_mismatch")
+    has_evidence = state.last_valid_evidence_id is not None
+    # The state record is deliberately checked independently from the evidence
+    # file.  A present but stale/broken reference gets its own evidence finding;
+    # these rules prevent impossible workflow combinations from looking valid.
+    expected: dict[WorkflowState, tuple[CompletionLevel, bool, bool]] = {
+        WorkflowState.INITIALIZED: (CompletionLevel.NONE, False, False),
+        WorkflowState.INPUTS_CHECKED: (CompletionLevel.NONE, False, False),
+        WorkflowState.ADAPTATION_PENDING_APPROVAL: (CompletionLevel.NONE, True, False),
+        WorkflowState.STAGE_DEVELOPMENT: (CompletionLevel.NONE, False, False),
+        WorkflowState.HUMAN_ACCEPTANCE_PENDING: (CompletionLevel.SYSTEM_VERIFIED, True, True),
+        WorkflowState.NEXT_STAGE_OR_FRONTEND: (CompletionLevel.HUMAN_ACCEPTED, False, True),
+    }
+    rule = expected.get(state.workflow_state)
+    if state.workflow_state is WorkflowState.SYSTEM_VERIFICATION:
+        valid = (
+            state.waiting_on is None
+            and ((state.current_stage.completion_level is CompletionLevel.IMPLEMENTED and not has_evidence)
+                 or (state.current_stage.completion_level is CompletionLevel.SYSTEM_VERIFIED and has_evidence))
+        )
+    elif rule is not None:
+        completion, requires_waiting, requires_evidence = rule
+        valid = (
+            state.current_stage.completion_level is completion
+            and (state.waiting_on is not None) == requires_waiting
+            and has_evidence == requires_evidence
+        )
+    else:
+        # Later protocol states are recognized even though V1 does not advance
+        # into them yet.  They must retain the accepted evidence invariant.
+        valid = (
+            state.current_stage.completion_level is CompletionLevel.HUMAN_ACCEPTED
+            and state.waiting_on is None and has_evidence
+        )
+    if not valid:
+        _add(findings, "workflow_invariant_invalid")
+    if state.revision > 0 and state.last_event_id is None:
+        _add(findings, "missing_last_event_id")
 
 
 def _validate_approvals(
@@ -414,7 +452,9 @@ def _lock_status(root: Path) -> str:
 
 
 def _evidence_status(findings: list[str], state: StateRecord | None) -> str:
-    if state is None or state.last_valid_evidence_id is None:
+    if state is None:
+        return "invalid" if "state_invalid" in findings else "not_recorded"
+    if state.last_valid_evidence_id is None:
         return "not_recorded"
     if "missing_referenced_evidence" in findings:
         return "missing"
@@ -478,7 +518,7 @@ def _only_repairable_audit_gap(findings: list[str]) -> bool:
 
 def _event_revision_is_valid(event: EventRecord) -> bool:
     """A repair event records an already-committed state, so it has no delta."""
-    if event.event_type in {"recovered_missing_event", "lock_taken_over"}:
+    if event.event_type in {"recovered_missing_event", "lock_taken_over", "lock_takeover_authorized"}:
         return event.after_revision == event.before_revision
     return event.after_revision == event.before_revision + 1
 

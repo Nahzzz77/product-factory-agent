@@ -147,45 +147,55 @@ def _dispatch_lock(args: Any, root: Path):
         manager.release(args.lock_id)
         return success("lock_released", "执行锁已释放", "其他会话现在可以获取锁", {})
     if args.lock_command == "takeover":
-        repo = _takeover_repository(root)
-        project = repo.load_project()
-        state = repo.load_state()
-        if project.project_id != state.project_id:
-            raise FactoryError(
-                "project_identity_mismatch", ErrorCategory.ENVIRONMENT_BLOCKED,
-                "项目状态与项目元数据的标识不一致", "lock takeover", False,
-                "修复项目元数据后重试",
-            )
-
-        def append_takeover_audit(old: LockRecord, replacement: LockRecord, reason: str) -> None:
-            details = {
-                "old_lock_id": old.lock_id,
-                "new_lock_id": replacement.lock_id,
-                "reason": reason,
-                "old_owner": old.owner.model_dump(mode="json"),
-                "new_owner": replacement.owner.model_dump(mode="json"),
-                "old_acquired_at": old.acquired_at.isoformat(),
-                "old_lease_expires_at": old.lease_expires_at.isoformat(),
-                "new_acquired_at": replacement.acquired_at.isoformat(),
-                "new_lease_expires_at": replacement.lease_expires_at.isoformat(),
-            }
+        def prepare_takeover(old: LockRecord):
+            # This provider is invoked only after LockManager owns the same
+            # SQLite mutation mutex used by every state transition.  Never load
+            # state before this point: its revision is the replacement fence.
+            repo = ProjectRepository(root)
             try:
-                repo.append_event(EventRecord(
-                    schema_version="1.0", event_id=str(uuid4()), event_type="lock_taken_over",
-                    project_id=project.project_id, before_revision=state.revision,
-                    after_revision=state.revision, created_at=datetime.now(timezone.utc), details=details,
-                ))
-            except OSError as exc:
+                project = repo.load_project()
+                state = repo.load_state()
+            except (OSError, UnicodeDecodeError, ValueError, ValidationError) as exc:
                 raise FactoryError(
-                    "takeover_audit_failed", ErrorCategory.ENVIRONMENT_BLOCKED,
-                    "执行锁已接管，但接管审计未能写入", "lock takeover", True,
-                    "修复审计存储后运行 validate；保留新锁 ID 以继续恢复",
-                    details,
+                    "project_protocol_invalid", ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "项目协议记录无效，不能审计接管执行锁", "lock takeover", False,
+                    "先运行 validate 并修复项目协议记录",
                 ) from exc
+            if project.project_id != state.project_id:
+                raise FactoryError(
+                    "project_identity_mismatch", ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "项目状态与项目元数据的标识不一致", "lock takeover", False,
+                    "修复项目元数据后重试",
+                )
+
+            def append_authorization(replacement: LockRecord) -> None:
+                details = {
+                    "old_lock_id": old.lock_id, "new_lock_id": replacement.lock_id,
+                    "reason": args.reason, "old_owner": old.owner.model_dump(mode="json"),
+                    "new_owner": replacement.owner.model_dump(mode="json"),
+                    "old_acquired_at": old.acquired_at.isoformat(),
+                    "old_lease_expires_at": old.lease_expires_at.isoformat(),
+                    "new_acquired_at": replacement.acquired_at.isoformat(),
+                    "new_lease_expires_at": replacement.lease_expires_at.isoformat(),
+                }
+                try:
+                    repo.append_event(EventRecord(
+                        schema_version="1.0", event_id=str(uuid4()), event_type="lock_takeover_authorized",
+                        project_id=project.project_id, before_revision=state.revision,
+                        after_revision=state.revision, created_at=datetime.now(timezone.utc), details=details,
+                    ))
+                except OSError as exc:
+                    raise FactoryError(
+                        "takeover_audit_failed", ErrorCategory.ENVIRONMENT_BLOCKED,
+                        "执行锁接管审计未能写入，原锁未变更", "lock takeover", True,
+                        "修复审计存储后重试接管",
+                        details,
+                    ) from exc
+            return state.revision, append_authorization
 
         result = manager.takeover(
-            args.old_lock_id, _owner(args.tool, args.session_id), state.revision, args.reason,
-            _lease(args.lease_seconds), on_committed=append_takeover_audit,
+            args.old_lock_id, _owner(args.tool, args.session_id), 0, args.reason,
+            _lease(args.lease_seconds), prepared=prepare_takeover,
         )
         return success("lock_taken_over", "已接管过期执行锁", "使用新锁 ID 继续操作", {"lock": result.lock, "takeover": result.details})
     raise RuntimeError("unreachable lock command")

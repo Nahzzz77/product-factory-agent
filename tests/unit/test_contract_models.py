@@ -12,6 +12,7 @@ from product_factory.contracts.models import (
     StateRecord,
     WorkflowState,
 )
+from product_factory.contracts.identifiers import is_portable_path_component
 
 
 def test_state_rejects_unknown_fields() -> None:
@@ -55,6 +56,31 @@ def test_state_enum_values_match_protocol() -> None:
         updated_at=datetime.now(timezone.utc),
     )
     assert state.workflow_state.value == "initialized"
+
+
+@pytest.mark.parametrize("value", ["CONIN$", "clock$.txt", "COM¹.log", "LPT³", "e\u0301"])
+def test_portable_identifier_rejects_windows_devices_and_non_nfc(value: str) -> None:
+    assert not is_portable_path_component(value)
+
+
+def test_portable_identifier_limits_encoded_lengths_and_accepts_nfc_unicode() -> None:
+    assert is_portable_path_component("证据-é")
+    assert not is_portable_path_component("é" * 128)  # 256 UTF-8 bytes
+    assert not is_portable_path_component("a" * 256)
+
+
+def test_workflow_collector_rejects_inputs_checked_as_implemented() -> None:
+    from product_factory.services.recovery import _validate_workflow_invariants
+
+    state = StateRecord(
+        schema_version="1.0", project_id="demo", revision=0,
+        workflow_state=WorkflowState.INPUTS_CHECKED,
+        current_stage=CurrentStage(id="stage-01", sequence=1, completion_level=CompletionLevel.IMPLEMENTED),
+        updated_at=datetime.now(timezone.utc),
+    )
+    findings: list[str] = []
+    _validate_workflow_invariants(state, findings)
+    assert findings == ["workflow_invariant_invalid"]
 
 
 @pytest.mark.parametrize("reason", [None, "", "   "])
