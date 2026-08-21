@@ -5,9 +5,8 @@ from __future__ import annotations
 import os
 import socket
 import sys
-from contextlib import contextmanager, redirect_stdout
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
-from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, Sequence
 from uuid import uuid4
@@ -18,6 +17,7 @@ from product_factory.cli.output import failure, internal_failure, render, succes
 from product_factory.cli.parser import ArgumentParseError, build_parser
 from product_factory.contracts.models import EventRecord, GateType, LockOwner, LockRecord
 from product_factory.errors import ErrorCategory, FactoryError
+from product_factory.resources import factory_resource_root
 from product_factory.services.evidence import record_evidence, verify_stage
 from product_factory.services.initialize import check_inputs, initialize_project
 from product_factory.services.recovery import repair_audit, resume_project, validate_project
@@ -55,9 +55,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _dispatch(args: Any):
+    if args.command == "web":
+        from product_factory.web.app import run_console
+
+        run_console(
+            Path(args.workspace), host=args.host, port=args.port,
+            open_browser=not args.no_open, allow_network=args.allow_network,
+        )
+        return success("web_stopped", "本地工作台已停止", "需要时重新运行 product-factory web", {})
+
     root = Path(args.project)
     if args.command == "init":
-        with _factory_root() as factory_root:
+        with factory_resource_root() as factory_root:
             state = initialize_project(
                 target=root,
                 project_id=args.project_id,
@@ -283,27 +292,6 @@ def _read_approval_statement(json_mode: bool) -> str:
         ) from exc
     except KeyboardInterrupt as exc:
         raise _interrupted_error() from exc
-
-
-@contextmanager
-def _factory_root():
-    """Materialize package-owned handbooks without assuming an installed path."""
-    resource_root = files("product_factory").joinpath("resources")
-    if resource_root.is_dir():
-        with as_file(resource_root) as root:
-            yield root
-        return
-    # Editable source runs retain a development-only fallback resolved from this
-    # module, never from the caller's working directory.  Installed wheels carry
-    # the resources inside the package and take the branch above.
-    source_root = Path(__file__).resolve().parents[3]
-    if (source_root / "references/handbooks/manifest.yaml").is_file():
-        yield source_root
-        return
-    raise FactoryError(
-        "handbook_invalid", ErrorCategory.INPUT_REQUIRED, "技术手册资源不可读取",
-        "init", False, "重新安装包含技术手册的 product-factory 包",
-    )
 
 
 def _argument_error() -> FactoryError:
