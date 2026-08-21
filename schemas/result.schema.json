@@ -1,0 +1,57 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "title": "Action",
+      "type": "string"
+    },
+    "category": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Category"
+    },
+    "code": {
+      "title": "Code",
+      "type": "string"
+    },
+    "details": {
+      "additionalProperties": true,
+      "title": "Details",
+      "type": "object"
+    },
+    "message": {
+      "title": "Message",
+      "type": "string"
+    },
+    "ok": {
+      "title": "Ok",
+      "type": "boolean"
+    },
+    "retryable": {
+      "title": "Retryable",
+      "type": "boolean"
+    },
+    "step": {
+      "title": "Step",
+      "type": "string"
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "category",
+    "message",
+    "step",
+    "retryable",
+    "action",
+    "details"
+  ],
+  "title": "ResultEnvelope",
+  "type": "object"
+}

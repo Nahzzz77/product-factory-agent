@@ -1,0 +1,27 @@
+schema_version: '1.0'
+project_id: demo-web
+prd_confirmed: true
+confirmed_by: verifier
+confirmed_at: '2026-08-21T00:00:00Z'
+requirements:
+  target_user_and_core_task:
+    status: present
+    source: PRD
+  input_process_output:
+    status: present
+    source: PRD
+  user_flow_and_confirmations:
+    status: present
+    source: PRD
+  scope_and_priority:
+    status: present
+    source: PRD
+  acceptance_criteria:
+    status: present
+    source: PRD
+  model_cost_platform:
+    status: present
+    source: PRD
+  data_privacy_performance_deployment:
+    status: present
+    source: PRD

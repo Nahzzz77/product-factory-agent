@@ -1,0 +1,193 @@
+{
+  "$defs": {
+    "EvidenceCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact_paths": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Artifact Paths",
+          "type": "array"
+        },
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "ended_at": {
+          "format": "date-time",
+          "title": "Ended At",
+          "type": "string"
+        },
+        "exit_status": {
+          "title": "Exit Status",
+          "type": "integer"
+        },
+        "mode": {
+          "enum": [
+            "not_applicable",
+            "mock",
+            "real"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "command",
+        "started_at",
+        "ended_at",
+        "exit_status",
+        "summary",
+        "mode"
+      ],
+      "title": "EvidenceCheck",
+      "type": "object"
+    },
+    "KnownIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking": {
+          "title": "Blocking",
+          "type": "boolean"
+        },
+        "severity": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary",
+        "severity",
+        "blocking"
+      ],
+      "title": "KnownIssue",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/EvidenceCheck"
+      },
+      "minItems": 1,
+      "title": "Checks",
+      "type": "array"
+    },
+    "evidence_id": {
+      "allOf": [
+        {
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        {
+          "not": {
+            "pattern": "[.]$"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Nn][Ii][Nn]\\$|[Cc][Oo][Nn][Oo][Uu][Tt]\\$|[Cc][Ll][Oo][Cc][Kk]\\$|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\..*)?$"
+          }
+        }
+      ],
+      "maxLength": 85,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._\\u3041-\\u3096\\u30a1-\\u30fa\\u30fc-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uac00-\\ud7a3-]{1,85}$",
+      "title": "Evidence Id",
+      "type": "string"
+    },
+    "factory_version": {
+      "title": "Factory Version",
+      "type": "string"
+    },
+    "known_issues": {
+      "items": {
+        "$ref": "#/$defs/KnownIssue"
+      },
+      "title": "Known Issues",
+      "type": "array"
+    },
+    "prd_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Prd Sha256",
+      "type": "string"
+    },
+    "ready_for_human_acceptance": {
+      "title": "Ready For Human Acceptance",
+      "type": "boolean"
+    },
+    "runtime_entry": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Runtime Entry"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_digest": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Source Digest",
+      "type": "string"
+    },
+    "stage_id": {
+      "title": "Stage Id",
+      "type": "string"
+    },
+    "state_revision": {
+      "title": "State Revision",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "evidence_id",
+    "stage_id",
+    "state_revision",
+    "factory_version",
+    "prd_sha256",
+    "source_digest",
+    "checks",
+    "ready_for_human_acceptance"
+  ],
+  "title": "EvidenceManifest",
+  "type": "object"
+}

@@ -1,0 +1,19 @@
+schema_version: "1.0"
+evidence_id: "evidence-01"
+stage_id: "stage-01"
+state_revision: 0
+factory_version: "0.1.0"
+prd_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+source_digest: "0000000000000000000000000000000000000000000000000000000000000000"
+runtime_entry: null
+checks:
+  - name: "offline core check"
+    command: "python -c 'print(\"ok\")'"
+    started_at: "2026-08-20T00:00:00Z"
+    ended_at: "2026-08-20T00:00:01Z"
+    exit_status: 0
+    summary: "offline check passed"
+    mode: "not_applicable"
+    artifact_paths: []
+known_issues: []
+ready_for_human_acceptance: true

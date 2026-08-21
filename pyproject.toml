@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "product-factory-agent"
+version = "0.1.0"
+description = "File-backed delivery protocol for local coding agents"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<9"]
+
+[project.scripts]
+product-factory = "product_factory.cli.main:main"
+product-factory-export-schemas = "product_factory.contracts.export:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/product_factory"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"references" = "product_factory/resources/references"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

@@ -1,0 +1,27 @@
+schema_version: "1.0"
+project_id: "example-project"
+prd_confirmed: false
+confirmed_by: "product-owner"
+confirmed_at: "2026-08-20T00:00:00Z"
+requirements:
+  target_user_and_core_task:
+    status: missing
+    source: "待产品负责人确认"
+  input_process_output:
+    status: missing
+    source: "待产品负责人确认"
+  user_flow_and_confirmations:
+    status: missing
+    source: "待产品负责人确认"
+  scope_and_priority:
+    status: missing
+    source: "待产品负责人确认"
+  acceptance_criteria:
+    status: missing
+    source: "待产品负责人确认"
+  model_cost_platform:
+    status: missing
+    source: "待产品负责人确认"
+  data_privacy_performance_deployment:
+    status: missing
+    source: "待产品负责人确认"

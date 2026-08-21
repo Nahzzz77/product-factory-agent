@@ -1,0 +1,52 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "after_revision": {
+      "title": "After Revision",
+      "type": "integer"
+    },
+    "before_revision": {
+      "title": "Before Revision",
+      "type": "integer"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "details": {
+      "additionalProperties": true,
+      "title": "Details",
+      "type": "object"
+    },
+    "event_id": {
+      "title": "Event Id",
+      "type": "string"
+    },
+    "event_type": {
+      "title": "Event Type",
+      "type": "string"
+    },
+    "project_id": {
+      "title": "Project Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "project_id",
+    "before_revision",
+    "after_revision",
+    "created_at",
+    "details"
+  ],
+  "title": "EventRecord",
+  "type": "object"
+}
