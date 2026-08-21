@@ -61,7 +61,7 @@ def create_server(
     *,
     service: ConsoleService,
     token: str | None = None,
-    max_body_bytes: int = 1_000_000,
+    max_body_bytes: int = 4_500_000,
 ) -> ConsoleHTTPServer:
     return ConsoleHTTPServer(
         (host, port), ConsoleRequestHandler, service=service,
@@ -135,9 +135,24 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             self._call(lambda: self.server.service.snapshot(query.get("path", [""])[0]))
             return
+        if parsed.path == "/api/agent-runs":
+            query = parse_qs(parsed.query)
+            self._call(
+                lambda: {
+                    "runs": self.server.service.agent_history(
+                        query.get("project_path", [""])[0]
+                    )
+                }
+            )
+            return
         if parsed.path.startswith("/api/agent-runs/"):
             run_id = parsed.path.rsplit("/", 1)[-1]
-            self._call(lambda: self.server.service.agent_runs.get(run_id))
+            query = parse_qs(parsed.query)
+            self._call(
+                lambda: self.server.service.get_agent_run(
+                    query.get("project_path", [""])[0], run_id
+                )
+            )
             return
         self._error(HTTPStatus.NOT_FOUND, "not_found", "页面不存在")
 
@@ -168,6 +183,14 @@ class ConsoleRequestHandler(BaseHTTPRequestHandler):
                     str(payload.get("project_path", "")), str(payload.get("objective", ""))
                 ),
                 status=HTTPStatus.ACCEPTED,
+            )
+            return
+        if parsed.path.startswith("/api/agent-runs/") and parsed.path.endswith("/cancel"):
+            run_id = parsed.path.split("/")[-2]
+            self._call(
+                lambda: self.server.service.cancel_agent(
+                    str(payload.get("project_path", "")), run_id
+                )
             )
             return
         self._error(HTTPStatus.NOT_FOUND, "not_found", "接口不存在")

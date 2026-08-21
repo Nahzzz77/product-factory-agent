@@ -28,10 +28,11 @@ python3 -m venv .venv
 系统默认只监听 `127.0.0.1:8765` 并打开浏览器。工作台提供：
 
 - 在指定工作区中创建全新项目；
-- 选择本机 PRD 和可选约束文件；
+- 在浏览器里直接选择 PRD 和可选约束文件，无需手填绝对路径；
 - 查看当前阶段、修订号、执行锁、恢复建议和协议健康状态；
 - 通过临时租约安全执行输入确认、技术审批、系统验证、证据登记和阶段验收；
 - 在允许的执行阶段，明确点击后启动本机 Codex 完成当前开发目标；
+- 实时查看 Codex 输出、停止运行中的任务，并在服务重启后继续查看历史日志；
 - 保存所有业务状态、审批、事件和证据到目标项目，而不是依赖浏览器会话。
 
 创建项目时，页面要求产品负责人明确确认两件事：PRD 是当前业务事实基线，以及 PRD 已覆盖协议要求的七类最低信息。工作台不会把模糊想法自动批准成 PRD。
@@ -121,6 +122,7 @@ cp examples/minimal-project/evidence-manifest.yaml /tmp/minimal-web/evidence-aut
 - `.product-factory/approvals.jsonl` 与 `.product-factory/events.jsonl`：只追加的审批和审计记录。
 - `.product-factory/execution-lock.json`：单写入者的租约记录；写操作需要它和匹配的修订号。
 - `.product-factory/evidence/<stage>/<evidence>/manifest.json`：一经登记即不可覆盖的阶段证据。
+- `.product-factory/agent-runs/<run-id>/`：Web 工作台启动的 Codex 任务元数据与输出日志。
 
 命令行入口仍然完整保留，适合自动化或其他 Agent 集成。默认输出适合人阅读。把全局 `--json` 放在命令前会得到稳定的机器可读结果；审批提示仍显示在终端，但批准语句不进入 JSON 结果。
 

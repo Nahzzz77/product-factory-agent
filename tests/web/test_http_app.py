@@ -43,6 +43,9 @@ def test_http_api_requires_token_and_serves_dashboard(tmp_path: Path) -> None:
         assert "总览" in dashboard
         assert "技术方案" in dashboard
         assert "开发工作区" in dashboard
+        assert "prd-file" in dashboard
+        assert "run-history" in dashboard
+        assert "cancel-run" in dashboard
         assert "test-token" not in dashboard
 
         status, _, body = _request(server, "GET", "/api/config")
@@ -69,6 +72,49 @@ def test_http_rejects_oversized_json(tmp_path: Path) -> None:
         )
         assert status == 413
         assert json.loads(body)["error"]["code"] == "request_too_large"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_http_creates_project_from_uploaded_prd_and_lists_run_history(tmp_path: Path) -> None:
+    service = ConsoleService(tmp_path, factory_root=FACTORY_ROOT)
+    server = create_server("127.0.0.1", 0, service=service, token="test-token")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, _, body = _request(
+            server,
+            "POST",
+            "/api/projects",
+            token="test-token",
+            body={
+                "directory": "browser-project",
+                "project_id": "browser-project",
+                "name": "浏览器项目",
+                "prd_content": "# PRD\n\n在浏览器内上传。\n",
+                "confirmed_by": "owner",
+                "prd_confirmed": True,
+                "requirements_confirmed": True,
+                "stage_id": "stage-01",
+                "stage_name": "Web MVP",
+            },
+        )
+        assert status == 201
+        project_path = json.loads(body)["data"]["path"]
+        assert (tmp_path / "browser-project/inputs/PRD.md").read_text(encoding="utf-8").endswith(
+            "在浏览器内上传。\n"
+        )
+
+        status, _, body = _request(
+            server,
+            "GET",
+            f"/api/agent-runs?project_path={project_path}",
+            token="test-token",
+        )
+        assert status == 200
+        assert json.loads(body)["data"]["runs"] == []
     finally:
         server.shutdown()
         server.server_close()

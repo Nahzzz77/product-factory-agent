@@ -1,4 +1,4 @@
-const state = { config: null, projects: [], current: null, runId: null };
+const state = { config: null, projects: [], current: null, runId: null, runTimer: null };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
@@ -130,6 +130,7 @@ async function openProject(path) {
   switchTab("overview");
   renderProject();
   await renderProjectListOnly();
+  await loadRunHistory();
 }
 
 async function renderProjectListOnly() {
@@ -175,7 +176,7 @@ function renderProjectContent(item) {
   text("#development-completion", labelCompletion(item.state.current_stage.completion_level));
   text("#development-revision", `r${item.state.revision}`);
   const run = item.agent_run;
-  text("#development-run", run ? `最近任务：${run.objective} · ${run.status === "running" ? "正在运行" : run.status === "completed" ? "已完成" : "执行失败"}` : "还没有 Codex 运行记录。完成需求确认和技术方案后，可以从这里启动开发。" );
+  text("#development-run", run ? `最近任务：${run.objective} · ${runSummaryLabel(run.status)}` : "还没有 Codex 运行记录。完成需求确认和技术方案后，可以从这里启动开发。" );
   text("#evidence-count", item.stats.evidence); text("#event-count", item.stats.events); text("#approval-count", item.stats.approvals);
   const verified = item.state.current_stage.completion_level === "system_verified" || item.state.current_stage.completion_level === "human_accepted";
   text("#evidence-status", verified ? "验证通过" : `${item.stats.evidence} 份证据`);
@@ -352,10 +353,13 @@ async function performAction(action, extra = {}) {
 
 function renderRun(run) {
   const box = $("#agent-run");
-  if (!run) { box.classList.add("hidden"); return; }
+  if (!run) { box.classList.add("hidden"); clearRunTimer(); return; }
   box.classList.remove("hidden"); state.runId = run.run_id;
-  text("#agent-run-status", run.status === "running" ? "Codex 正在工作…" : run.status === "completed" ? "Codex 已完成" : "Codex 执行失败");
+  text("#agent-run-status", runStatusLabel(run.status));
   text("#agent-output", run.output || "等待输出…");
+  $("#cancel-run").classList.toggle("hidden", !["running", "cancelling"].includes(run.status));
+  if (["running", "cancelling"].includes(run.status)) scheduleRunPoll();
+  else clearRunTimer();
 }
 
 function openAgent(objective = "") {
@@ -373,15 +377,74 @@ async function startAgent() {
   const button = $("#start-agent"); button.disabled = true;
   try {
     const run = await api("/api/agent-runs", { method: "POST", body: JSON.stringify({ project_path: state.current.path, objective }) });
-    renderRun(run); showToast("Codex 已启动");
+    renderRun(run); await loadRunHistory(); showToast("Codex 已启动");
   } catch (error) { showToast(error.message); }
   finally { button.disabled = !agentAllowed(); }
 }
 
 async function refreshRun() {
   if (!state.runId) return;
-  try { const run = await api(`/api/agent-runs/${encodeURIComponent(state.runId)}`); renderRun(run); }
+  if (!state.current) return;
+  try {
+    const run = await api(`/api/agent-runs/${encodeURIComponent(state.runId)}?project_path=${encodeURIComponent(state.current.path)}`);
+    renderRun(run);
+    if (!["running", "cancelling"].includes(run.status)) {
+      const activeTab = document.querySelector("#project-tabs button.active")?.dataset.tab || "overview";
+      state.current = await api(`/api/project?path=${encodeURIComponent(state.current.path)}`);
+      renderProject(); switchTab(activeTab);
+      await loadRunHistory();
+    }
+  }
   catch (error) { showToast(error.message); }
+}
+
+function clearRunTimer() {
+  if (state.runTimer) window.clearTimeout(state.runTimer);
+  state.runTimer = null;
+}
+
+function scheduleRunPoll() {
+  clearRunTimer();
+  state.runTimer = window.setTimeout(() => refreshRun(), 900);
+}
+
+async function cancelRun() {
+  if (!state.current || !state.runId) return;
+  const button = $("#cancel-run"); button.disabled = true;
+  try {
+    const run = await api(`/api/agent-runs/${encodeURIComponent(state.runId)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ project_path: state.current.path }),
+    });
+    renderRun(run); showToast("正在停止 Codex 任务");
+  } catch (error) { showToast(error.message); }
+  finally { button.disabled = false; }
+}
+
+async function loadRunHistory() {
+  const root = $("#run-history");
+  if (!state.current) { root.replaceChildren(); return; }
+  try {
+    const payload = await api(`/api/agent-runs?project_path=${encodeURIComponent(state.current.path)}`);
+    root.replaceChildren();
+    if (!payload.runs.length) { root.append(emptyMessage("还没有 Codex 运行记录")); return; }
+    for (const run of payload.runs.slice(0, 10)) {
+      const row = document.createElement("button"); row.className = "run-history-row";
+      const status = document.createElement("span"); status.className = `run-status ${run.status}`; status.textContent = runStatusLabel(run.status).replace("Codex ", "");
+      const copy = document.createElement("span"); const title = document.createElement("strong"); title.textContent = run.objective;
+      const meta = document.createElement("small"); meta.textContent = run.exit_code === null ? "点击查看输出" : `退出码 ${run.exit_code} · 点击查看输出`; copy.append(title, meta);
+      const time = document.createElement("time"); time.textContent = formatTime(run.started_at);
+      row.append(status, copy, time); row.addEventListener("click", () => { renderRun(run); $("#agent-dialog").showModal(); }); root.append(row);
+    }
+  } catch (error) { root.replaceChildren(emptyMessage(error.message)); }
+}
+
+function runStatusLabel(status) {
+  return ({ running: "Codex 正在工作…", cancelling: "正在停止…", completed: "Codex 已完成", failed: "Codex 执行失败", cancelled: "任务已停止", interrupted: "任务已中断" })[status] || status;
+}
+
+function runSummaryLabel(status) {
+  return ({ running: "正在运行", cancelling: "正在停止", completed: "已完成", failed: "执行失败", cancelled: "已停止", interrupted: "已中断" })[status] || status;
 }
 
 function labelState(value) { return ({ initialized: "已初始化", inputs_checked: "输入已确认", adaptation_pending_approval: "等待技术审批", stage_development: "阶段开发", system_verification: "系统验证", human_acceptance_pending: "等待人工验收", next_stage_or_frontend: "里程碑完成" })[value] || value; }
@@ -403,14 +466,29 @@ async function createProject(event) {
   event.preventDefault();
   const form = event.currentTarget; const data = new FormData(form);
   const payload = Object.fromEntries(data.entries());
+  delete payload.prd_file; delete payload.constraints_file;
   for (const key of ["prd_confirmed", "requirements_confirmed", "requires_real_model"]) payload[key] = data.has(key);
   const errorBox = $("#create-error"); errorBox.classList.add("hidden");
   const submit = form.querySelector('[type="submit"]'); submit.disabled = true;
   try {
+    const prd = $("#prd-file").files[0];
+    if (!prd) throw new Error("请选择 PRD 需求文档");
+    if (prd.size > 1_000_000) throw new Error("PRD 文件不能超过 1 MB");
+    payload.prd_content = await prd.text(); payload.prd_filename = prd.name;
+    const constraints = $("#constraints-file").files[0];
+    if (constraints) {
+      if (constraints.size > 1_000_000) throw new Error("约束文件不能超过 1 MB");
+      payload.constraints_content = await constraints.text(); payload.constraints_filename = constraints.name;
+    }
     const created = await api("/api/projects", { method: "POST", body: JSON.stringify(payload) });
-    closeCreate(); form.reset(); showToast("项目已创建"); await loadProjects(created.path);
+    closeCreate(); form.reset(); updateFileName("prd"); updateFileName("constraints"); showToast("项目已创建"); await loadProjects(created.path);
   } catch (error) { errorBox.textContent = error.message; errorBox.classList.remove("hidden"); }
   finally { submit.disabled = false; }
+}
+
+function updateFileName(kind) {
+  const file = $(`#${kind}-file`).files[0];
+  text(`#${kind}-file-name`, file ? `${file.name} · ${Math.max(1, Math.round(file.size / 1024))} KB` : kind === "prd" ? "选择 Markdown 或文本文件" : "选择约束文件");
 }
 
 $("#new-project").addEventListener("click", openCreate);
@@ -424,6 +502,10 @@ $("#create-form").addEventListener("submit", createProject);
 $("#refresh").addEventListener("click", () => loadProjects(state.current?.path).catch((error) => showToast(error.message)));
 $("#start-agent").addEventListener("click", startAgent);
 $("#refresh-run").addEventListener("click", refreshRun);
+$("#cancel-run").addEventListener("click", cancelRun);
+$("#refresh-history").addEventListener("click", loadRunHistory);
+$("#prd-file").addEventListener("change", () => updateFileName("prd"));
+$("#constraints-file").addEventListener("change", () => updateFileName("constraints"));
 $("#project-path").addEventListener("click", () => copyPath(state.current?.path || "", "项目路径已复制"));
 $("#workspace-button").addEventListener("click", () => copyPath(state.config?.workspace || "", "工作区路径已复制"));
 document.querySelectorAll("#project-tabs button").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));

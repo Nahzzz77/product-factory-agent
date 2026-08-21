@@ -150,6 +150,7 @@
           <div class="development-grid">
             <article class="content-card agent-workspace"><div class="agent-workspace-head"><span>✦</span><div><h3>Codex 执行区</h3><p>基于 PRD、技术方案和当前阶段完成开发任务。</p></div></div><button class="primary" id="development-agent">交给 Codex 开发</button><div id="development-run" class="run-summary"></div></article>
             <article class="content-card stage-brief"><h3>当前阶段</h3><dl><div><dt>阶段</dt><dd id="development-stage"></dd></div><div><dt>完成度</dt><dd id="development-completion"></dd></div><div><dt>修订号</dt><dd id="development-revision"></dd></div></dl><div class="stage-note">Agent 可以修改本地代码、运行测试和修复问题，但不能代替你批准跨阶段。</div></article>
+            <article class="content-card run-history-card"><div class="section-title"><div><h3>运行历史</h3><p>日志保存在项目中，关闭工作台后也不会丢失。</p></div><button class="text-button" id="refresh-history">刷新</button></div><div id="run-history" class="run-history"></div></article>
           </div>
         </section>
 
@@ -176,7 +177,7 @@
     <textarea id="agent-objective" rows="6" placeholder="例如：阅读 PRD，完成技术适配文档。说明前后端方案、数据存储、主要风险和验收方法。"></textarea>
     <div class="agent-actions"><span id="codex-status">检测中</span><button class="primary" id="start-agent">开始执行</button></div>
     <div id="agent-run" class="agent-run hidden">
-      <div><strong id="agent-run-status"></strong><button class="text-button" id="refresh-run">刷新输出</button></div>
+      <div><strong id="agent-run-status"></strong><div class="run-controls"><button class="danger-text hidden" id="cancel-run">停止任务</button><button class="text-button" id="refresh-run">刷新输出</button></div></div>
       <pre id="agent-output"></pre>
     </div>
   </dialog>
@@ -194,8 +195,8 @@
         <label class="wide">保存到工作区的文件夹<input name="directory" required placeholder="interview-agent"></label>
       </div></div>
       <div class="form-section"><h3>需求文件</h3><div class="form-grid">
-        <label class="wide">PRD 文件的本机路径<input name="prd_path" required placeholder="/Users/you/Documents/PRD.md"></label>
-        <label class="wide optional">约束文件路径 <span>可选</span><input name="constraints_path" placeholder="/Users/you/Documents/constraints.md"></label>
+        <label class="wide upload-field"><span class="upload-title">PRD 需求文档 <b>必填</b></span><span class="upload-control"><span class="upload-icon">MD</span><span><strong id="prd-file-name">选择 Markdown 或文本文件</strong><small>最大 1 MB，文件内容会作为项目需求基线</small></span><input type="file" name="prd_file" id="prd-file" required accept=".md,.txt,text/markdown,text/plain"></span></label>
+        <label class="wide upload-field optional"><span class="upload-title">项目约束 <b>可选</b></span><span class="upload-control"><span class="upload-icon">TXT</span><span><strong id="constraints-file-name">选择约束文件</strong><small>可用于补充预算、平台、合规或技术限制</small></span><input type="file" name="constraints_file" id="constraints-file" accept=".md,.txt,text/markdown,text/plain"></span></label>
       </div></div>
       <details class="advanced"><summary>高级设置</summary><div class="form-grid">
         <label>首阶段 ID<input name="stage_id" required value="stage-01"></label>

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -11,7 +12,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import yaml
 
@@ -34,15 +35,21 @@ from product_factory.services.recovery import repair_audit, resume_project, vali
 from product_factory.services.workflow import WorkflowService
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
-from product_factory.storage.files import read_contained_regular_bytes
+from product_factory.storage.files import atomic_write_json, read_contained_regular_bytes
+
+
+_MAX_UPLOAD_BYTES = 1_000_000
+_MAX_AGENT_OUTPUT_BYTES = 100_000
 
 
 class AgentRunManager:
-    """Launch explicitly requested Codex runs without shell interpolation."""
+    """Launch Codex safely, stream its output, and retain project-local history."""
 
     def __init__(self, executable: str | None = None) -> None:
         self.executable = executable or shutil.which("codex")
         self._runs: dict[str, dict[str, Any]] = {}
+        self._processes: dict[str, subprocess.Popen[str]] = {}
+        self._cancel_requested: set[str] = set()
         self._mutex = threading.Lock()
 
     @property
@@ -84,6 +91,10 @@ class AgentRunManager:
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
         }
+        run_directory = self._run_directory(project, run_id)
+        run_directory.mkdir(parents=True, exist_ok=False)
+        (run_directory / "output.log").touch(exist_ok=False)
+        self._persist(record)
         with self._mutex:
             self._runs[run_id] = record
         thread = threading.Thread(
@@ -91,48 +102,158 @@ class AgentRunManager:
             name=f"product-factory-agent-{run_id[:8]}",
         )
         thread.start()
-        return self.get(run_id)
+        return self.get(run_id, project)
 
-    def get(self, run_id: str) -> dict[str, Any]:
+    def get(self, run_id: str, project: Path | None = None) -> dict[str, Any]:
+        if not _valid_run_id(run_id):
+            raise _web_error("agent_run_not_found", "找不到这次 Codex 任务", "刷新项目后重试")
         with self._mutex:
             record = self._runs.get(run_id)
-            if record is None:
-                raise _web_error("agent_run_not_found", "找不到这次 Codex 任务", "刷新项目后重试")
-            return dict(record)
+        if record is None and project is not None:
+            record = self._load(project.resolve(), run_id)
+            if record is not None:
+                with self._mutex:
+                    self._runs[run_id] = record
+        if record is None:
+            raise _web_error("agent_run_not_found", "找不到这次 Codex 任务", "刷新项目后重试")
+        return dict(record)
 
     def latest_for(self, project: Path) -> dict[str, Any] | None:
-        resolved = str(project.resolve())
+        history = self.history(project)
+        return history[0] if history else None
+
+    def history(self, project: Path) -> list[dict[str, Any]]:
+        project = project.resolve()
+        records: dict[str, dict[str, Any]] = {}
+        root = project / ".product-factory" / "agent-runs"
+        try:
+            entries = list(os.scandir(root))
+        except FileNotFoundError:
+            entries = []
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False) or not _valid_run_id(entry.name):
+                continue
+            record = self._load(project, entry.name)
+            if record is not None:
+                records[record["run_id"]] = record
         with self._mutex:
-            candidates = [item for item in self._runs.values() if item["project_path"] == resolved]
-            return dict(candidates[-1]) if candidates else None
+            for record in self._runs.values():
+                if record.get("project_path") == str(project):
+                    records[record["run_id"]] = dict(record)
+        return sorted(records.values(), key=lambda item: item.get("started_at", ""), reverse=True)
+
+    def cancel(self, run_id: str, project: Path) -> dict[str, Any]:
+        current = self.get(run_id, project)
+        if current["status"] not in {"running", "cancelling"}:
+            return current
+        with self._mutex:
+            self._cancel_requested.add(run_id)
+            process = self._processes.get(run_id)
+            record = self._runs[run_id]
+            record["status"] = "cancelling"
+            snapshot = dict(record)
+        self._persist(snapshot)
+        if process is not None and process.poll() is None:
+            process.terminate()
+        return snapshot
 
     def _execute(self, run_id: str, command: list[str], prompt: str, project: Path) -> None:
+        process: subprocess.Popen[str] | None = None
+        log_path = self._run_directory(project, run_id) / "output.log"
+        failure_output = ""
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 command,
-                input=prompt,
+                stdin=subprocess.PIPE,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=project,
-                check=False,
-                timeout=None,
+                bufsize=1,
             )
-            output = completed.stdout[-100_000:]
-            status = "completed" if completed.returncode == 0 else "failed"
-            exit_code: int | None = completed.returncode
+            with self._mutex:
+                self._processes[run_id] = process
+                cancel_now = run_id in self._cancel_requested
+            if cancel_now:
+                process.terminate()
+            if process.stdin is not None:
+                try:
+                    process.stdin.write(prompt)
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            with log_path.open("a", encoding="utf-8", newline="") as log:
+                if process.stdout is not None:
+                    for line in process.stdout:
+                        log.write(line)
+                        log.flush()
+                        with self._mutex:
+                            record = self._runs[run_id]
+                            record["output"] = (record["output"] + line)[-_MAX_AGENT_OUTPUT_BYTES:]
+                log.flush()
+                os.fsync(log.fileno())
+            exit_code = process.wait()
+            with self._mutex:
+                cancelled = run_id in self._cancel_requested
+            status = "cancelled" if cancelled else "completed" if exit_code == 0 else "failed"
         except (OSError, subprocess.SubprocessError) as exc:
-            output = f"Codex 启动失败：{type(exc).__name__}"
+            failure_output = f"Codex 启动失败：{type(exc).__name__}"
             status = "failed"
             exit_code = None
+            try:
+                log_path.write_text(failure_output, encoding="utf-8")
+            except OSError:
+                pass
         with self._mutex:
             record = self._runs[run_id]
-            record.update(
+            snapshot = dict(record)
+            if status == "failed" and not snapshot["output"]:
+                snapshot["output"] = failure_output
+            snapshot.update(
                 status=status,
                 exit_code=exit_code,
-                output=output,
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
+            self._processes.pop(run_id, None)
+            self._cancel_requested.discard(run_id)
+        self._persist(snapshot)
+        with self._mutex:
+            self._runs[run_id].update(snapshot)
+
+    @staticmethod
+    def _run_directory(project: Path, run_id: str) -> Path:
+        return project / ".product-factory" / "agent-runs" / run_id
+
+    def _persist(self, record: dict[str, Any]) -> None:
+        payload = {key: value for key, value in record.items() if key != "output"}
+        atomic_write_json(
+            self._run_directory(Path(record["project_path"]), record["run_id"]) / "run.json",
+            payload,
+        )
+
+    def _load(self, project: Path, run_id: str) -> dict[str, Any] | None:
+        try:
+            metadata = json.loads(
+                read_contained_regular_bytes(
+                    project, (".product-factory", "agent-runs", run_id, "run.json")
+                )
+            )
+            output = read_contained_regular_bytes(
+                project, (".product-factory", "agent-runs", run_id, "output.log")
+            ).decode("utf-8", errors="replace")[-_MAX_AGENT_OUTPUT_BYTES:]
+        except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("run_id") != run_id:
+            return None
+        if metadata.get("project_path") != str(project):
+            return None
+        metadata["output"] = output
+        if metadata.get("status") in {"running", "cancelling"}:
+            metadata["status"] = "interrupted"
+            metadata["finished_at"] = metadata.get("finished_at") or datetime.now(timezone.utc).isoformat()
+        return metadata
 
 
 class ConsoleService:
@@ -211,9 +332,6 @@ class ConsoleService:
         confirmed_by = _required_text(payload, "confirmed_by")
         stage_id = _required_text(payload, "stage_id")
         stage_name = _required_text(payload, "stage_name")
-        prd_source = Path(_required_text(payload, "prd_path")).expanduser().resolve()
-        constraints_raw = str(payload.get("constraints_path", "")).strip()
-        constraints_source = Path(constraints_raw).expanduser().resolve() if constraints_raw else None
         intake = IntakeRecord(
             schema_version="1.0",
             project_id=project_id,
@@ -228,21 +346,38 @@ class ConsoleService:
                 for key in sorted(REQUIREMENT_KEYS)
             },
         )
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as temporary:
-            yaml.safe_dump(
-                intake.model_dump(mode="json"), temporary, allow_unicode=True, sort_keys=False
+        with tempfile.TemporaryDirectory(prefix="product-factory-web-") as staging_raw:
+            staging = Path(staging_raw)
+            if "prd_content" in payload:
+                prd_source = _write_uploaded_document(payload, "prd_content", staging / "PRD.md")
+            else:
+                prd_source = Path(_required_text(payload, "prd_path")).expanduser().resolve()
+            if "constraints_content" in payload:
+                constraints_source = _write_uploaded_document(
+                    payload, "constraints_content", staging / "constraints.md"
+                )
+            else:
+                constraints_raw = str(payload.get("constraints_path", "")).strip()
+                constraints_source = (
+                    Path(constraints_raw).expanduser().resolve() if constraints_raw else None
+                )
+            intake_source = staging / "intake.yaml"
+            intake_source.write_text(
+                yaml.safe_dump(
+                    intake.model_dump(mode="json"), allow_unicode=True, sort_keys=False
+                ),
+                encoding="utf-8",
             )
-            temporary.flush()
             if self.factory_root is not None:
                 initialize_project(
-                    target, project_id, name, prd_source, Path(temporary.name),
+                    target, project_id, name, prd_source, intake_source,
                     [(stage_id, stage_name, bool(payload.get("requires_real_model", False)))],
                     self.factory_root, constraints_source,
                 )
             else:
                 with factory_resource_root() as root:
                     initialize_project(
-                        target, project_id, name, prd_source, Path(temporary.name),
+                        target, project_id, name, prd_source, intake_source,
                         [(stage_id, stage_name, bool(payload.get("requires_real_model", False)))],
                         root, constraints_source,
                     )
@@ -388,9 +523,21 @@ class ConsoleService:
                 "先完成当前人工操作或进入可执行阶段",
             )
         active = self.agent_runs.latest_for(root)
-        if active and active["status"] == "running":
+        if active and active["status"] in {"running", "cancelling"}:
             raise _web_error("agent_already_running", "这个项目已有 Codex 任务在运行", "等待任务完成")
         return self.agent_runs.start(root, objective)
+
+    def agent_history(self, project_path: Path | str) -> list[dict[str, Any]]:
+        root = self.resolve_project_path(str(project_path), require_managed=True)
+        return self.agent_runs.history(root)
+
+    def get_agent_run(self, project_path: Path | str, run_id: str) -> dict[str, Any]:
+        root = self.resolve_project_path(str(project_path), require_managed=True)
+        return self.agent_runs.get(run_id, root)
+
+    def cancel_agent(self, project_path: Path | str, run_id: str) -> dict[str, Any]:
+        root = self.resolve_project_path(str(project_path), require_managed=True)
+        return self.agent_runs.cancel(run_id, root)
 
     def resolve_project_path(self, value: str, *, require_managed: bool) -> Path:
         raw = Path(value).expanduser()
@@ -451,5 +598,25 @@ def _required_text(payload: dict[str, Any], key: str) -> str:
     return value
 
 
+def _write_uploaded_document(payload: dict[str, Any], key: str, destination: Path) -> Path:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise _web_error("prd_upload_invalid", "上传的文档无法读取", "重新选择 Markdown 或文本文件")
+    encoded = value.encode("utf-8")
+    if not value.strip() or len(encoded) > _MAX_UPLOAD_BYTES:
+        raise _web_error(
+            "prd_upload_invalid", "上传的文档为空或超过 1 MB", "选择 1 MB 以内的非空文本文件"
+        )
+    destination.write_bytes(encoded)
+    return destination
+
+
 def _web_error(code: str, message: str, action: str) -> FactoryError:
     return FactoryError(code, ErrorCategory.INPUT_REQUIRED, message, "web", False, action)
+
+
+def _valid_run_id(value: str) -> bool:
+    try:
+        return str(UUID(value)) == value
+    except (ValueError, AttributeError, TypeError):
+        return False
