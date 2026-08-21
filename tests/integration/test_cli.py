@@ -1,4 +1,6 @@
+import errno
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -212,6 +214,52 @@ def test_human_argument_error_does_not_print_argparse_usage() -> None:
     assert result.stdout == ""
     assert result.stderr.startswith("未完成：")
     assert "usage:" not in result.stderr
+
+
+def test_help_preserves_normal_argparse_output() -> None:
+    result = run_cli("--help")
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout.startswith("usage: product-factory")
+    assert "产品工厂交付协议命令行" in result.stdout
+
+
+@pytest.mark.parametrize("arguments", (("--help",), ("lock", "--help")))
+def test_help_exits_cleanly_when_stdout_pipe_has_no_reader(arguments: tuple[str, ...]) -> None:
+    """Argparse help must not turn a closed consumer into exit code 120."""
+    executable = Path(sys.executable).parent / "product-factory"
+    assert executable.is_file()
+
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        process = subprocess.Popen(
+            [str(executable), *arguments], stdout=write_fd, stderr=subprocess.PIPE, text=True,
+        )
+    finally:
+        os.close(write_fd)
+    _, stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 0
+    assert stderr == ""
+
+
+def test_help_closed_pipe_tolerates_stdout_without_fileno(monkeypatch: pytest.MonkeyPatch) -> None:
+    from product_factory.cli.parser import build_parser
+
+    class NoFileDescriptorPipe:
+        def write(self, _message: str) -> None:
+            raise BrokenPipeError(errno.EPIPE, "broken pipe")
+
+        def flush(self) -> None:
+            raise AssertionError("write should already have failed")
+
+    monkeypatch.setattr(sys, "stdout", NoFileDescriptorPipe())
+    with pytest.raises(SystemExit) as exited:
+        build_parser().parse_args(["--help"])
+
+    assert exited.value.code == 0
 
 
 def test_approve_rejects_bad_preflight_without_reading_stdin(

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import os
+import sys
 
 
 class ArgumentParseError(Exception):
@@ -15,6 +18,48 @@ class ProtocolArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         del message
         raise ArgumentParseError
+
+    def _print_message(self, message: str | None, file=None) -> None:
+        """Write argparse's built-in help without leaking a closed pipe at exit."""
+        if not message:
+            return
+        destination = sys.stdout if file is None else file
+        try:
+            destination.write(message)
+            destination.flush()
+        except (BrokenPipeError, OSError) as error:
+            if error.errno != errno.EPIPE:
+                raise
+            self._stdout_pipe_closed = True
+            _silence_output_stream(destination)
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if message:
+            self._print_message(message, sys.stderr)
+        if getattr(self, "_stdout_pipe_closed", False):
+            status = 0
+        raise SystemExit(status)
+
+
+def _silence_output_stream(stream) -> None:
+    """Replace a broken output descriptor so shutdown cannot reflush EPIPE."""
+    try:
+        stream_fd = stream.fileno()
+    except (AttributeError, OSError):
+        # Test capture streams and StringIO do not necessarily expose a file
+        # descriptor.  They also have no OS-level descriptor to reflush.
+        return
+
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(devnull_fd, stream_fd)
+    except OSError:
+        return
+    finally:
+        os.close(devnull_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:
