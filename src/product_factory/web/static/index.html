@@ -3,110 +3,134 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>产品工厂 · 本地工作台</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23173f32'/%3E%3Ctext x='32' y='40' text-anchor='middle' font-family='Arial' font-weight='700' font-size='24' fill='%23d8ff74'%3EPF%3C/text%3E%3C/svg%3E">
+  <title>产品工厂</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231d4ed8'/%3E%3Cpath d='M18 18h28v28H18z' fill='none' stroke='white' stroke-width='5'/%3E%3Cpath d='M27 27h10v10H27z' fill='white'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">PF</span>
-        <div><strong>产品工厂</strong><small>LOCAL CONSOLE</small></div>
-      </div>
-      <button class="new-project" id="new-project">＋ 创建项目</button>
-      <div class="sidebar-label">项目</div>
+      <div class="brand"><span class="brand-mark"><i></i></span><strong>产品工厂</strong></div>
+      <button class="new-project" id="new-project"><span>＋</span> 新建项目</button>
+      <div class="sidebar-label">我的项目</div>
       <nav id="project-list" aria-label="项目列表"></nav>
-      <div class="workspace-card">
-        <span>工作区</span>
-        <code id="workspace">正在读取…</code>
+      <div class="sidebar-footer">
+        <div class="local-state"><span></span>仅在本机运行</div>
+        <button class="workspace-button" id="workspace-button" title="项目工作区">
+          <span class="folder-icon">⌂</span><code id="workspace">正在读取…</code>
+        </button>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
-        <div><span class="status-dot"></span>本地运行 · 数据不会上传到产品工厂</div>
-        <button class="ghost" id="refresh">刷新</button>
+        <div id="breadcrumb">工作台</div>
+        <div class="topbar-actions"><span>所有数据保存在你的项目文件夹</span><button class="icon-button" id="refresh" aria-label="刷新" title="刷新">↻</button></div>
       </header>
 
       <section id="empty-view" class="empty-view">
-        <div class="hero-orbit"><span>PRD</span><span>CODE</span><span>TEST</span><b>PF</b></div>
-        <p class="eyebrow">FROM PRODUCT FACTS TO VERIFIED SOFTWARE</p>
-        <h1>把确认过的需求，推进成<br><em>可运行、可验收</em>的产品。</h1>
-        <p class="lead">创建一个新项目，产品工厂会保存阶段、审批和验证证据；你可以从这里让 Codex 执行当前阶段的开发任务。</p>
-        <button class="primary large" id="empty-create">创建第一个项目</button>
+        <div class="empty-visual" aria-hidden="true">
+          <div class="paper paper-back"></div><div class="paper paper-mid"></div>
+          <div class="paper paper-front"><span></span><b></b><b></b><b></b><i>✓</i></div>
+        </div>
+        <p class="kicker">从一份确认过的 PRD 开始</p>
+        <h1>把想清楚的产品，<br>一步步做出来。</h1>
+        <p class="lead">产品工厂会安排开发步骤、保存每次确认，并在合适的时候让 Codex 开始工作。你只需要关注当前这一步。</p>
+        <button class="primary large" id="empty-create">创建我的第一个项目</button>
+        <div class="empty-steps"><span><b>1</b>选择 PRD</span><i></i><span><b>2</b>让 Codex 开发</span><i></i><span><b>3</b>亲自验收</span></div>
       </section>
 
       <section id="project-view" class="project-view hidden">
-        <div class="project-heading">
+        <div class="project-header">
           <div>
-            <p class="eyebrow" id="project-id"></p>
+            <div class="project-meta"><span id="project-id"></span><i></i><span id="project-stage"></span></div>
             <h1 id="project-name"></h1>
-            <p class="path" id="project-path"></p>
+            <button class="path-button" id="project-path"></button>
           </div>
-          <div class="health" id="health-badge">正在检查</div>
+          <div class="health" id="health-badge"><span></span>正在检查</div>
         </div>
 
-        <div class="metric-grid">
-          <article><span>当前阶段</span><strong id="workflow-state">—</strong></article>
-          <article><span>修订号</span><strong id="revision">—</strong></article>
-          <article><span>完成级别</span><strong id="completion">—</strong></article>
-          <article><span>执行锁</span><strong id="lock-status">—</strong></article>
-        </div>
+        <ol class="progress" id="progress" aria-label="项目进度">
+          <li data-step="input"><span>1</span><div><b>需求确认</b><small>确认要做什么</small></div></li>
+          <li data-step="plan"><span>2</span><div><b>技术方案</b><small>确认怎么做</small></div></li>
+          <li data-step="build"><span>3</span><div><b>开发实现</b><small>Codex 开始工作</small></div></li>
+          <li data-step="verify"><span>4</span><div><b>系统验证</b><small>测试与证据</small></div></li>
+          <li data-step="accept"><span>5</span><div><b>人工验收</b><small>由你最终确认</small></div></li>
+        </ol>
 
-        <div class="content-grid">
-          <section class="panel journey-panel">
-            <div class="panel-title"><div><span>流程</span><h2>下一步操作</h2></div><span class="step-pill" id="step-pill"></span></div>
+        <div class="workspace-grid">
+          <section class="focus-card">
+            <div class="focus-topline"><span class="focus-label">现在要做</span><span id="step-pill"></span></div>
             <div id="action-area"></div>
+          </section>
+
+          <aside class="summary-card">
+            <div class="summary-title"><h2>项目状态</h2><span id="workflow-state">—</span></div>
+            <dl>
+              <div><dt>当前版本</dt><dd id="revision">—</dd></div>
+              <div><dt>完成情况</dt><dd id="completion">—</dd></div>
+              <div><dt>写入状态</dt><dd id="lock-status">—</dd></div>
+            </dl>
             <details class="details">
-              <summary>协议恢复建议</summary>
-              <code id="next-command"></code>
+              <summary>查看技术详情</summary>
+              <label>安全恢复建议</label><code id="next-command"></code>
               <ul id="findings"></ul>
             </details>
-          </section>
-
-          <section class="panel agent-panel">
-            <div class="panel-title"><div><span>执行 Agent</span><h2>让 Codex 开发</h2></div><span id="codex-status" class="availability">检测中</span></div>
-            <p>Codex 只能在当前项目目录和当前阶段内工作。它不能替你审批、部署或创建付费资源。</p>
-            <label for="agent-objective">本次开发目标</label>
-            <textarea id="agent-objective" rows="5" placeholder="例如：根据 PRD 完成技术适配文档，并说明前后端方案和验收方式。"></textarea>
-            <button class="primary" id="start-agent">启动 Codex</button>
-            <div id="agent-run" class="agent-run hidden">
-              <div><strong id="agent-run-status"></strong><button class="ghost small" id="refresh-run">刷新输出</button></div>
-              <pre id="agent-output"></pre>
-            </div>
-          </section>
+          </aside>
         </div>
 
-        <section class="panel guardrails">
-          <div><span>01</span><strong>PRD 是事实基线</strong><p>需求变化必须重新确认，不能由 Agent 静默修改。</p></div>
-          <div><span>02</span><strong>阶段内自主</strong><p>编码、测试和修复可以自动进行，跨阶段必须由你批准。</p></div>
-          <div><span>03</span><strong>证据先于验收</strong><p>系统验证记录和源码摘要通过后，才会开放阶段验收。</p></div>
+        <section class="principles">
+          <div><span>需求不会被偷偷改动</span><p>PRD 始终是项目的事实基线。</p></div>
+          <div><span>Agent 不会替你做决定</span><p>技术方案和产品验收都需要你确认。</p></div>
+          <div><span>每一步都有记录</span><p>测试、审批和恢复信息都保存在项目里。</p></div>
         </section>
       </section>
     </main>
   </div>
 
-  <dialog id="create-dialog">
+  <dialog id="agent-dialog" class="agent-dialog">
+    <div class="dialog-heading">
+      <div><span class="dialog-icon">✦</span><div><p>CODEX</p><h2>交给 Codex 完成</h2></div></div>
+      <button type="button" class="close" id="close-agent" aria-label="关闭">×</button>
+    </div>
+    <div class="agent-boundary"><span></span><p>只允许修改当前项目、完成当前阶段。不会替你审批、部署或创建付费资源。</p></div>
+    <label for="agent-objective">告诉 Codex 这次要完成什么</label>
+    <textarea id="agent-objective" rows="6" placeholder="例如：阅读 PRD，完成技术适配文档。说明前后端方案、数据存储、主要风险和验收方法。"></textarea>
+    <div class="agent-actions"><span id="codex-status">检测中</span><button class="primary" id="start-agent">开始执行</button></div>
+    <div id="agent-run" class="agent-run hidden">
+      <div><strong id="agent-run-status"></strong><button class="text-button" id="refresh-run">刷新输出</button></div>
+      <pre id="agent-output"></pre>
+    </div>
+  </dialog>
+
+  <dialog id="create-dialog" class="create-dialog">
     <form id="create-form" method="dialog">
-      <div class="dialog-heading"><div><p class="eyebrow">NEW PRODUCT</p><h2>创建受管 Web 项目</h2></div><button type="button" class="close" id="close-dialog" aria-label="关闭">×</button></div>
-      <div class="form-grid">
+      <div class="dialog-heading">
+        <div><span class="dialog-icon">＋</span><div><p>新项目</p><h2>从 PRD 开始创建</h2></div></div>
+        <button type="button" class="close" id="close-dialog" aria-label="关闭">×</button>
+      </div>
+      <p class="dialog-intro">选择一份已经确认的产品需求文档。产品工厂只创建新项目，不会覆盖已有内容。</p>
+      <div class="form-section"><h3>项目信息</h3><div class="form-grid">
         <label>项目名称<input name="name" required placeholder="例如：智能访谈助手"></label>
-        <label>项目 ID<input name="project_id" required pattern="[a-z0-9][a-z0-9\-]{2,63}" placeholder="interview-agent"></label>
-        <label class="wide">项目文件夹<input name="directory" required placeholder="interview-agent"><small>在当前工作区内创建，不会接管已有非空目录。</small></label>
+        <label>项目 ID<input name="project_id" required pattern="[a-z0-9][a-z0-9\-]{2,63}" placeholder="interview-agent"><small>英文小写、数字和短横线</small></label>
+        <label class="wide">保存到工作区的文件夹<input name="directory" required placeholder="interview-agent"></label>
+      </div></div>
+      <div class="form-section"><h3>需求文件</h3><div class="form-grid">
         <label class="wide">PRD 文件的本机路径<input name="prd_path" required placeholder="/Users/you/Documents/PRD.md"></label>
-        <label class="wide">约束文件路径（可选）<input name="constraints_path" placeholder="/Users/you/Documents/constraints.md"></label>
+        <label class="wide optional">约束文件路径 <span>可选</span><input name="constraints_path" placeholder="/Users/you/Documents/constraints.md"></label>
+      </div></div>
+      <details class="advanced"><summary>高级设置</summary><div class="form-grid">
         <label>首阶段 ID<input name="stage_id" required value="stage-01"></label>
         <label>首阶段名称<input name="stage_name" required value="Web MVP"></label>
         <label>确认人<input name="confirmed_by" required value="product-owner"></label>
-        <label class="check"><input type="checkbox" name="requires_real_model"> 本阶段需要真实模型验证</label>
-      </div>
+        <label class="check"><input type="checkbox" name="requires_real_model"> 本阶段需要真实模型</label>
+      </div></details>
       <div class="confirm-box">
-        <label class="check"><input type="checkbox" name="prd_confirmed" required> 我确认这份 PRD 是当前业务事实基线。</label>
-        <label class="check"><input type="checkbox" name="requirements_confirmed" required> 我确认 PRD 已包含用户、输入输出、流程、范围、验收、成本平台、数据部署七类信息。</label>
+        <label class="check"><input type="checkbox" name="prd_confirmed" required><span>我确认这份 PRD 是当前业务事实基线。</span></label>
+        <label class="check"><input type="checkbox" name="requirements_confirmed" required><span>我确认 PRD 已写明用户、流程、范围、验收、成本和数据要求。</span></label>
       </div>
       <div id="create-error" class="form-error hidden"></div>
-      <div class="dialog-actions"><button type="button" class="ghost" id="cancel-create">取消</button><button type="submit" class="primary">创建项目</button></div>
+      <div class="dialog-actions"><button type="button" class="secondary" id="cancel-create">取消</button><button type="submit" class="primary">创建并进入项目</button></div>
     </form>
   </dialog>
 

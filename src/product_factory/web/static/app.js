@@ -27,6 +27,7 @@ async function loadConfig() {
   status.textContent = state.config.codex_available ? "已就绪" : "未找到";
   status.style.color = state.config.codex_available ? "#26713c" : "#a73535";
   $("#start-agent").disabled = !state.config.codex_available;
+  if (state.current) renderAgentAvailability(state.current);
 }
 
 async function loadProjects(selectPath = null) {
@@ -36,7 +37,7 @@ async function loadProjects(selectPath = null) {
   for (const project of state.projects) {
     const button = document.createElement("button"); button.className = "project-link";
     const strong = document.createElement("strong"); strong.textContent = project.name;
-    const small = document.createElement("small"); small.textContent = `${project.workflow_state} · r${project.revision}`;
+    const small = document.createElement("small"); small.textContent = `${labelState(project.workflow_state)} · 版本 ${project.revision}`;
     button.append(strong, small);
     button.addEventListener("click", () => openProject(project.path));
     if (state.current?.path === project.path) button.classList.add("active");
@@ -50,6 +51,7 @@ async function loadProjects(selectPath = null) {
 
 function showEmpty() {
   state.current = null;
+  text("#breadcrumb", "工作台");
   $("#empty-view").classList.remove("hidden");
   $("#project-view").classList.add("hidden");
 }
@@ -70,7 +72,10 @@ async function renderProjectListOnly() {
 
 function renderProject() {
   const item = state.current;
-  text("#project-id", item.project.project_id.toUpperCase());
+  const stage = item.project.stage_plan.find((entry) => entry.id === item.state.current_stage.id);
+  text("#breadcrumb", `项目 / ${item.project.name}`);
+  text("#project-id", item.project.project_id);
+  text("#project-stage", stage?.name || item.state.current_stage.id);
   text("#project-name", item.project.name);
   text("#project-path", item.path);
   text("#workflow-state", labelState(item.state.workflow_state));
@@ -80,13 +85,33 @@ function renderProject() {
   text("#step-pill", item.state.current_stage.id);
   text("#next-command", item.recovery.next_command);
   const health = $("#health-badge");
-  health.textContent = item.validation.valid ? "协议记录健康" : "需要修复";
+  const healthDot = document.createElement("span");
+  health.replaceChildren(healthDot, document.createTextNode(item.validation.valid ? "项目记录正常" : "项目需要修复"));
   health.classList.toggle("invalid", !item.validation.valid);
   const findings = $("#findings"); findings.replaceChildren();
   for (const finding of item.validation.findings) { const li = document.createElement("li"); li.textContent = finding; findings.append(li); }
   renderAction(item);
+  renderProgress(item);
   renderAgentAvailability(item);
   renderRun(item.agent_run);
+}
+
+function renderProgress(item) {
+  const order = ["input", "plan", "build", "verify", "accept"];
+  const current = ({
+    initialized: "input",
+    inputs_checked: "plan",
+    adaptation_pending_approval: "plan",
+    stage_development: "build",
+    system_verification: "verify",
+    human_acceptance_pending: "accept",
+    next_stage_or_frontend: "done",
+  })[item.state.workflow_state] || "input";
+  const currentIndex = current === "done" ? order.length : order.indexOf(current);
+  document.querySelectorAll("#progress li").forEach((node, index) => {
+    node.classList.toggle("done", index < currentIndex || current === "done");
+    node.classList.toggle("current", index === currentIndex && current !== "done");
+  });
 }
 
 function agentAllowed(item = state.current) {
@@ -103,6 +128,7 @@ function renderAgentAvailability(item) {
   else status.textContent = allowed ? "已就绪" : "等待可执行阶段";
   status.style.color = allowed ? "#26713c" : "#a06b19";
   $("#start-agent").disabled = !allowed;
+  document.querySelectorAll("[data-open-agent]").forEach((button) => { button.disabled = !allowed; });
 }
 
 function actionCard(title, description) {
@@ -118,8 +144,8 @@ function inputField(label, name, value = "") {
   wrapper.append(input); return wrapper;
 }
 
-function actionButton(card, label, action, payload = () => ({})) {
-  const button = document.createElement("button"); button.className = "primary"; button.textContent = label;
+function actionButton(card, label, action, payload = () => ({}), style = "primary") {
+  const button = document.createElement("button"); button.className = style; button.textContent = label;
   button.addEventListener("click", async () => {
     button.disabled = true;
     try { await performAction(action, payload(card)); showToast("操作完成"); }
@@ -129,43 +155,59 @@ function actionButton(card, label, action, payload = () => ({})) {
   card.append(button);
 }
 
+function agentSuggestion(card, title, description, objective) {
+  const box = document.createElement("div"); box.className = "agent-suggestion";
+  const copy = document.createElement("div");
+  const spark = document.createElement("span"); spark.className = "spark"; spark.textContent = "✦";
+  const words = document.createElement("span");
+  const strong = document.createElement("b"); strong.textContent = title;
+  const small = document.createElement("small"); small.textContent = description;
+  words.append(strong, small); copy.append(spark, words);
+  const button = document.createElement("button"); button.textContent = "交给 Codex"; button.dataset.openAgent = "true";
+  button.addEventListener("click", () => openAgent(objective));
+  box.append(copy, button); card.append(box);
+}
+
 function renderAction(item) {
   const area = $("#action-area"); area.replaceChildren();
   const workflow = item.state.workflow_state;
   const completion = item.state.current_stage.completion_level;
   let card;
   if (!item.validation.valid) {
-    card = actionCard("先修复协议记录", "项目记录存在异常。请查看下方 findings，不会在损坏状态下猜测下一步写操作。");
+    card = actionCard("这个项目需要先检查一下", "记录中发现了不一致。为避免误改项目，产品工厂已经暂停写入。请展开右侧技术详情查看原因。");
   } else if (workflow === "initialized") {
-    card = actionCard("确认项目输入", "检查 PRD 基线和七类最低信息，成功后进入技术适配阶段。");
-    actionButton(card, "检查并确认输入", "check_inputs");
+    card = actionCard("先确认这份需求可以开工", "产品工厂会检查 PRD 是否与创建时确认的版本一致，以及必要信息是否齐全。这个操作不会修改你的 PRD。");
+    actionButton(card, "确认需求，进入下一步", "check_inputs");
   } else if (workflow === "inputs_checked") {
-    card = actionCard("请求技术适配审批", "先让 Codex 生成 docs/technical-adaptation.md，再把这份方案提交给你审批。");
-    card.append(inputField("技术方案文件", "artifact", "docs/technical-adaptation.md"));
-    actionButton(card, "提交技术方案", "request_adaptation", (root) => ({ artifact: root.querySelector("input").value }));
+    card = actionCard("准备一份你能看懂的技术方案", "先让 Codex 阅读 PRD，写清楚准备怎么做、有什么风险、怎样验收。方案完成后，再提交给你确认。");
+    agentSuggestion(card, "建议交给 Codex 准备", "它会停在审批前，不会直接开始开发", "阅读 PRD 和项目资料，生成 docs/technical-adaptation.md。方案要用产品负责人能理解的语言说明技术路线、前后端边界、数据存储、主要风险、费用与安全边界、测试和验收方法。不要推进状态或替我审批。");
+    card.append(inputField("已经准备好的方案文件", "artifact", "docs/technical-adaptation.md"));
+    actionButton(card, "提交给我确认", "request_adaptation", (root) => ({ artifact: root.querySelector("input").value }), "secondary");
   } else if (workflow === "adaptation_pending_approval" || workflow === "human_acceptance_pending") {
     const stageGate = workflow === "human_acceptance_pending";
-    card = actionCard(stageGate ? "人工阶段验收" : "人工技术方案审批", "这一步只能由你本人完成。批准语句必须与协议文本完全相同。");
+    card = actionCard(stageGate ? "请亲自体验并验收这个阶段" : "请确认这份技术方案", stageGate ? "打开实际产品，按照验收清单走完核心流程。确认体验和结果符合 PRD 后，再在这里批准。" : "阅读技术适配文档，重点检查范围、费用、平台和暂缓项。只有你能批准进入开发。");
     card.append(inputField("确认人", "actor", "product-owner"));
-    card.append(inputField("批准语句", "statement", state.config.approval_statement));
-    actionButton(card, "确认并批准", "approve", (root) => ({
+    card.append(inputField("批准语句", "statement", state.config?.approval_statement || "验收通过，批准进入下一阶段。"));
+    actionButton(card, stageGate ? "验收通过，进入下一阶段" : "批准方案，开始开发", "approve", (root) => ({
       actor: root.querySelector('[name="actor"]').value,
       statement: root.querySelector('[name="statement"]').value,
     }));
   } else if (workflow === "stage_development") {
-    card = actionCard("当前阶段开发", "让 Codex 完成当前阶段，确认代码和测试已准备好后进入系统验证。");
-    actionButton(card, "开发完成，进入验证", "start_verification");
+    card = actionCard("开始完成这个阶段的产品", "Codex 可以在当前项目中编码、测试和修复。它完成后会把改动和验证结果交给你，不会自行跨过验收。");
+    agentSuggestion(card, "让 Codex 开始开发", "严格按照当前 PRD 和已经批准的技术方案执行", "完成当前阶段的开发任务。严格依据 inputs/PRD.md 和已批准的 docs/technical-adaptation.md，先检查现有项目，再实现、测试并进行浏览器验证。不要推进产品工厂状态，不要替我验收或部署。");
+    actionButton(card, "代码已经完成，进入系统验证", "start_verification", () => ({}), "secondary");
   } else if (workflow === "system_verification" && completion === "implemented") {
-    card = actionCard("登记并验证证据", "先登记 evidence-authoring.yaml，再使用不可变证据 ID 验证当前源码。");
+    card = actionCard("用测试结果证明它真的能运行", "登记本阶段的测试、构建和真实运行结果。证据会绑定当前代码，之后修改代码就需要重新验证。");
+    agentSuggestion(card, "需要补测试或修复？", "Codex 可以继续在当前阶段处理问题", "检查当前阶段实现和测试结果，修复未通过的问题，完成真实运行与浏览器检查，并准备 evidence-authoring.yaml。不要登记证据、推进状态或替我验收。");
     card.append(inputField("证据清单文件", "manifest", "evidence-authoring.yaml"));
     card.append(inputField("证据 ID", "evidence_id", "evidence-01"));
     actionButton(card, "登记证据", "record_evidence", (root) => ({ manifest: root.querySelector('[name="manifest"]').value }));
-    actionButton(card, "验证证据", "verify_stage", (root) => ({ evidence_id: root.querySelector('[name="evidence_id"]').value }));
+    actionButton(card, "验证当前代码", "verify_stage", (root) => ({ evidence_id: root.querySelector('[name="evidence_id"]').value }), "secondary");
   } else if (workflow === "system_verification" && completion === "system_verified") {
-    card = actionCard("请求阶段验收", "系统证据已经通过。现在可以把实际产品交给你亲自操作验收。");
-    actionButton(card, "进入人工验收", "request_acceptance");
+    card = actionCard("系统检查通过，轮到你体验了", "自动测试和运行证据已经通过。下一步不会继续写代码，而是请你亲自判断产品是否真的好用。");
+    actionButton(card, "开始人工验收", "request_acceptance");
   } else if (workflow === "next_stage_or_frontend") {
-    card = actionCard("首个里程碑已验收", "核心内核已经记录本阶段完成。后续阶段编排将在下一里程碑继续扩展。");
+    card = actionCard("这个阶段已经完成", "你的验收结果、测试证据和项目状态都已经保存。当前版本将在这里安全停下，等待后续阶段能力。");
   } else {
     card = actionCard("查看恢复建议", "当前状态没有可由本版控制台安全执行的动作。");
   }
@@ -188,6 +230,14 @@ function renderRun(run) {
   text("#agent-run-status", run.status === "running" ? "Codex 正在工作…" : run.status === "completed" ? "Codex 已完成" : "Codex 执行失败");
   text("#agent-output", run.output || "等待输出…");
 }
+
+function openAgent(objective = "") {
+  if (objective) $("#agent-objective").value = objective;
+  renderAgentAvailability(state.current);
+  $("#agent-dialog").showModal();
+}
+
+function closeAgent() { $("#agent-dialog").close(); }
 
 async function startAgent() {
   if (!state.current) return;
@@ -213,6 +263,12 @@ function labelCompletion(value) { return ({ none: "尚未实现", implemented: "
 function openCreate() { $("#create-error").classList.add("hidden"); $("#create-dialog").showModal(); }
 function closeCreate() { $("#create-dialog").close(); }
 
+async function copyPath(value, message) {
+  if (!navigator.clipboard) { showToast("当前浏览器不支持自动复制"); return; }
+  try { await navigator.clipboard.writeText(value); showToast(message); }
+  catch { showToast("复制失败，请手动选择路径"); }
+}
+
 async function createProject(event) {
   event.preventDefault();
   const form = event.currentTarget; const data = new FormData(form);
@@ -231,9 +287,12 @@ $("#new-project").addEventListener("click", openCreate);
 $("#empty-create").addEventListener("click", openCreate);
 $("#close-dialog").addEventListener("click", closeCreate);
 $("#cancel-create").addEventListener("click", closeCreate);
+$("#close-agent").addEventListener("click", closeAgent);
 $("#create-form").addEventListener("submit", createProject);
 $("#refresh").addEventListener("click", () => loadProjects(state.current?.path).catch((error) => showToast(error.message)));
 $("#start-agent").addEventListener("click", startAgent);
 $("#refresh-run").addEventListener("click", refreshRun);
+$("#project-path").addEventListener("click", () => copyPath(state.current?.path || "", "项目路径已复制"));
+$("#workspace-button").addEventListener("click", () => copyPath(state.config?.workspace || "", "工作区路径已复制"));
 
 Promise.all([loadConfig(), loadProjects()]).catch((error) => showToast(error.message));
