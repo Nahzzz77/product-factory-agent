@@ -11,6 +11,7 @@
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark"><i></i></span><strong>产品工厂</strong></div>
+      <button class="home-link active" id="home-link"><span>⌂</span>工作台</button>
       <button class="new-project" id="new-project"><span>＋</span> 新建项目</button>
       <div class="sidebar-label">我的项目</div>
       <nav id="project-list" aria-label="项目列表"></nav>
@@ -27,6 +28,33 @@
         <div id="breadcrumb">工作台</div>
         <div class="topbar-actions"><span>所有数据保存在你的项目文件夹</span><button class="icon-button" id="refresh" aria-label="刷新" title="刷新">↻</button></div>
       </header>
+
+      <section id="dashboard-view" class="dashboard-view hidden">
+        <div class="dashboard-heading">
+          <div><p class="kicker">产品交付工作空间</p><h1>工作台</h1><p>项目、待确认事项和最近进展都在这里。</p></div>
+          <button class="primary" id="dashboard-create">＋ 创建新项目</button>
+        </div>
+        <div class="dashboard-metrics">
+          <article><span>项目总数</span><strong id="metric-projects">0</strong><small>当前工作区</small></article>
+          <article><span>等待你确认</span><strong id="metric-pending">0</strong><small>审批与验收</small></article>
+          <article><span>Agent 运行中</span><strong id="metric-agents">0</strong><small>Codex 任务</small></article>
+          <article><span>需要处理</span><strong id="metric-issues">0</strong><small>协议或记录异常</small></article>
+        </div>
+        <div class="dashboard-grid">
+          <section class="dashboard-panel projects-panel">
+            <div class="section-heading"><div><h2>所有项目</h2><p>继续最近的工作，或者查看项目当前进度。</p></div><span id="project-count"></span></div>
+            <div id="project-cards" class="project-cards"></div>
+          </section>
+          <aside class="dashboard-panel pending-panel">
+            <div class="section-heading"><div><h2>待你处理</h2><p>需要人工判断的事项</p></div></div>
+            <div id="pending-list" class="pending-list"></div>
+          </aside>
+        </div>
+        <section class="dashboard-panel activity-overview">
+          <div class="section-heading"><div><h2>最近项目</h2><p>按最后更新时间排列</p></div></div>
+          <div id="recent-projects" class="recent-projects"></div>
+        </section>
+      </section>
 
       <section id="empty-view" class="empty-view">
         <div class="empty-visual" aria-hidden="true">
@@ -50,6 +78,16 @@
           <div class="health" id="health-badge"><span></span>正在检查</div>
         </div>
 
+        <nav class="project-tabs" id="project-tabs" aria-label="项目内容">
+          <button class="active" data-tab="overview">总览</button>
+          <button data-tab="requirements">需求</button>
+          <button data-tab="plan">技术方案</button>
+          <button data-tab="development">开发</button>
+          <button data-tab="verification">验证</button>
+          <button data-tab="delivery">交付</button>
+        </nav>
+
+        <section class="tab-panel" data-panel="overview">
         <ol class="progress" id="progress" aria-label="项目进度">
           <li data-step="input"><span>1</span><div><b>需求确认</b><small>确认要做什么</small></div></li>
           <li data-step="plan"><span>2</span><div><b>技术方案</b><small>确认怎么做</small></div></li>
@@ -79,10 +117,50 @@
           </aside>
         </div>
 
+        <div class="insight-grid">
+          <section class="content-card">
+            <div class="section-heading"><div><h2>项目资料</h2><p>开发过程中使用的事实和方案</p></div><button class="text-button" data-go-tab="requirements">查看全部</button></div>
+            <div id="document-list" class="document-list"></div>
+          </section>
+          <section class="content-card">
+            <div class="section-heading"><div><h2>最近活动</h2><p>状态、审批和验证记录</p></div></div>
+            <div id="activity-list" class="activity-list"></div>
+          </section>
+        </div>
+
         <section class="principles">
           <div><span>需求不会被偷偷改动</span><p>PRD 始终是项目的事实基线。</p></div>
           <div><span>Agent 不会替你做决定</span><p>技术方案和产品验收都需要你确认。</p></div>
           <div><span>每一步都有记录</span><p>测试、审批和恢复信息都保存在项目里。</p></div>
+        </section>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="requirements">
+          <div class="page-heading"><div><p>PRODUCT REQUIREMENTS</p><h2>产品需求</h2><span>这里展示创建项目时确认的 PRD 基线，Agent 不能静默修改。</span></div><span class="document-badge">事实来源</span></div>
+          <article class="document-viewer"><div class="document-toolbar"><div><span class="file-icon">M↓</span><div><b>产品需求文档</b><small id="prd-path"></small></div></div><button class="secondary" id="copy-prd">复制内容</button></div><pre id="prd-content"></pre></article>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="plan">
+          <div class="page-heading"><div><p>TECHNICAL PLAN</p><h2>技术方案</h2><span>把产品需求翻译成技术路线、风险边界和验收方法。</span></div><span class="document-badge" id="plan-status">尚未生成</span></div>
+          <article class="document-viewer"><div class="document-toolbar"><div><span class="file-icon">M↓</span><div><b>技术适配方案</b><small id="plan-path"></small></div></div><button class="secondary" id="plan-agent">✦ 让 Codex 准备</button></div><pre id="plan-content"></pre></article>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="development">
+          <div class="page-heading"><div><p>DEVELOPMENT</p><h2>开发工作区</h2><span>查看当前阶段、交给 Codex 执行，并跟踪最近一次运行。</span></div><span class="document-badge" id="development-status"></span></div>
+          <div class="development-grid">
+            <article class="content-card agent-workspace"><div class="agent-workspace-head"><span>✦</span><div><h3>Codex 执行区</h3><p>基于 PRD、技术方案和当前阶段完成开发任务。</p></div></div><button class="primary" id="development-agent">交给 Codex 开发</button><div id="development-run" class="run-summary"></div></article>
+            <article class="content-card stage-brief"><h3>当前阶段</h3><dl><div><dt>阶段</dt><dd id="development-stage"></dd></div><div><dt>完成度</dt><dd id="development-completion"></dd></div><div><dt>修订号</dt><dd id="development-revision"></dd></div></dl><div class="stage-note">Agent 可以修改本地代码、运行测试和修复问题，但不能代替你批准跨阶段。</div></article>
+          </div>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="verification">
+          <div class="page-heading"><div><p>VERIFICATION</p><h2>验证与证据</h2><span>自动测试、真实运行和不可变证据共同证明当前代码可用。</span></div><span class="document-badge" id="evidence-status"></span></div>
+          <div class="verification-grid"><article class="content-card verification-hero"><span class="verification-icon">✓</span><div><h3 id="verification-title">等待进入验证</h3><p id="verification-description"></p></div><button class="secondary" data-go-tab="overview">返回当前操作</button></article><article class="content-card evidence-stats"><div><span>证据记录</span><strong id="evidence-count">0</strong></div><div><span>审计事件</span><strong id="event-count">0</strong></div><div><span>人工审批</span><strong id="approval-count">0</strong></div></article></div>
+        </section>
+
+        <section class="tab-panel hidden" data-panel="delivery">
+          <div class="page-heading"><div><p>DELIVERY</p><h2>交付准备</h2><span>整理可交付状态、已知问题和下一阶段安排。</span></div><span class="document-badge">受人工门禁保护</span></div>
+          <div class="delivery-card"><div class="delivery-track"><span class="complete">需求基线</span><i></i><span id="delivery-development">开发与验证</span><i></i><span id="delivery-acceptance">人工验收</span><i></i><span>可部署准备</span></div><h3 id="delivery-title">项目仍在开发流程中</h3><p id="delivery-description">完成当前阶段验证并由你亲自验收后，才会进入下一项交付工作。</p><div class="delivery-guard"><b>上线保护</b><span>正式部署、公开访问和付费资源仍需要单独授权。</span></div></div>
         </section>
       </section>
     </main>

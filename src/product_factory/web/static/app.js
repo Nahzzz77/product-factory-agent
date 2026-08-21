@@ -45,22 +45,89 @@ async function loadProjects(selectPath = null) {
   }
   const target = selectPath || state.current?.path;
   if (target) await openProject(target);
-  else if (state.projects.length) await openProject(state.projects[0].path);
+  else if (state.projects.length) showDashboard();
   else showEmpty();
 }
 
 function showEmpty() {
   state.current = null;
   text("#breadcrumb", "工作台");
+  $("#home-link").classList.add("active");
   $("#empty-view").classList.remove("hidden");
+  $("#dashboard-view").classList.add("hidden");
   $("#project-view").classList.add("hidden");
 }
+
+function showDashboard() {
+  if (!state.projects.length) { showEmpty(); return; }
+  state.current = null;
+  text("#breadcrumb", "工作台");
+  $("#home-link").classList.add("active");
+  $("#empty-view").classList.add("hidden");
+  $("#project-view").classList.add("hidden");
+  $("#dashboard-view").classList.remove("hidden");
+  renderDashboard();
+  renderProjectListOnly();
+}
+
+function renderDashboard() {
+  const pending = state.projects.filter((project) => project.waiting_on || ["adaptation_pending_approval", "human_acceptance_pending"].includes(project.workflow_state));
+  const agents = state.projects.filter((project) => project.agent_run?.status === "running");
+  const issues = state.projects.filter((project) => !project.valid);
+  text("#metric-projects", state.projects.length);
+  text("#metric-pending", pending.length);
+  text("#metric-agents", agents.length);
+  text("#metric-issues", issues.length);
+  text("#project-count", `${state.projects.length} 个项目`);
+  const cards = $("#project-cards"); cards.replaceChildren();
+  for (const project of state.projects) cards.append(projectCard(project));
+  const pendingList = $("#pending-list"); pendingList.replaceChildren();
+  if (!pending.length) pendingList.append(emptyMessage("目前没有等待你确认的事项"));
+  for (const project of pending) {
+    const row = document.createElement("button"); row.className = "pending-item";
+    const icon = document.createElement("span"); icon.textContent = "!";
+    const copy = document.createElement("div");
+    const title = document.createElement("b"); title.textContent = project.name;
+    const hint = document.createElement("small"); hint.textContent = project.workflow_state === "human_acceptance_pending" ? "等待你完成阶段验收" : "等待你确认技术方案";
+    copy.append(title, hint); row.append(icon, copy); row.addEventListener("click", () => openProject(project.path)); pendingList.append(row);
+  }
+  const recent = $("#recent-projects"); recent.replaceChildren();
+  for (const project of [...state.projects].sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, 6)) {
+    const row = document.createElement("button"); row.className = "recent-item";
+    const dot = document.createElement("span"); const copy = document.createElement("div");
+    const title = document.createElement("b"); title.textContent = project.name;
+    const time = document.createElement("small"); time.textContent = `${labelState(project.workflow_state)} · ${formatTime(project.updated_at)}`;
+    copy.append(title, time); row.append(dot, copy); row.addEventListener("click", () => openProject(project.path)); recent.append(row);
+  }
+}
+
+function projectCard(project) {
+  const card = document.createElement("article"); card.className = "project-card"; card.tabIndex = 0;
+  const head = document.createElement("div"); head.className = "project-card-head";
+  const icon = document.createElement("span"); icon.className = "project-card-icon"; icon.textContent = project.name.slice(0, 1).toUpperCase();
+  const badge = document.createElement("span"); badge.className = "project-card-state"; badge.textContent = labelState(project.workflow_state); head.append(icon, badge);
+  const title = document.createElement("h3"); title.textContent = project.name;
+  const stage = document.createElement("p"); stage.textContent = `${project.current_stage.id} · 版本 ${project.revision}`;
+  const bar = document.createElement("div"); bar.className = "mini-progress"; const fill = document.createElement("span"); fill.style.width = `${progressPercent(project.workflow_state)}%`; bar.append(fill);
+  const footer = document.createElement("div"); footer.className = "project-card-footer";
+  const next = document.createElement("span"); next.textContent = project.waiting_on ? "等待人工确认" : "可继续工作";
+  const time = document.createElement("span"); time.textContent = formatTime(project.updated_at); footer.append(next, time);
+  card.append(head, title, stage, bar, footer);
+  card.addEventListener("click", () => openProject(project.path));
+  card.addEventListener("keydown", (event) => { if (event.key === "Enter") openProject(project.path); });
+  return card;
+}
+
+function emptyMessage(message) { const item = document.createElement("div"); item.className = "empty-list"; item.textContent = message; return item; }
 
 async function openProject(path) {
   const payload = await api(`/api/project?path=${encodeURIComponent(path)}`);
   state.current = payload;
+  $("#home-link").classList.remove("active");
   $("#empty-view").classList.add("hidden");
+  $("#dashboard-view").classList.add("hidden");
   $("#project-view").classList.remove("hidden");
+  switchTab("overview");
   renderProject();
   await renderProjectListOnly();
 }
@@ -92,8 +159,66 @@ function renderProject() {
   for (const finding of item.validation.findings) { const li = document.createElement("li"); li.textContent = finding; findings.append(li); }
   renderAction(item);
   renderProgress(item);
+  renderProjectContent(item);
   renderAgentAvailability(item);
   renderRun(item.agent_run);
+}
+
+function renderProjectContent(item) {
+  const documents = new Map(item.documents.map((document) => [document.id, document]));
+  const prd = documents.get("prd"); const plan = documents.get("technical-adaptation");
+  text("#prd-path", prd?.path); text("#prd-content", prd?.content || "产品需求文档不可读取。");
+  text("#plan-path", plan?.path); text("#plan-content", plan?.exists ? plan.content : "技术方案还没有生成。\n\n返回“总览”，让 Codex 阅读 PRD 并准备技术适配方案。");
+  text("#plan-status", plan?.exists ? "已生成" : "尚未生成");
+  text("#development-status", labelState(item.state.workflow_state));
+  text("#development-stage", item.state.current_stage.id);
+  text("#development-completion", labelCompletion(item.state.current_stage.completion_level));
+  text("#development-revision", `r${item.state.revision}`);
+  const run = item.agent_run;
+  text("#development-run", run ? `最近任务：${run.objective} · ${run.status === "running" ? "正在运行" : run.status === "completed" ? "已完成" : "执行失败"}` : "还没有 Codex 运行记录。完成需求确认和技术方案后，可以从这里启动开发。" );
+  text("#evidence-count", item.stats.evidence); text("#event-count", item.stats.events); text("#approval-count", item.stats.approvals);
+  const verified = item.state.current_stage.completion_level === "system_verified" || item.state.current_stage.completion_level === "human_accepted";
+  text("#evidence-status", verified ? "验证通过" : `${item.stats.evidence} 份证据`);
+  text("#verification-title", verified ? "当前阶段已经通过系统验证" : item.state.workflow_state === "system_verification" ? "正在准备系统验证" : "等待进入系统验证");
+  text("#verification-description", verified ? "证据已经绑定当前代码，可以进入人工验收。" : "完成开发后，登记测试、构建和真实运行证据。" );
+  const accepted = item.state.current_stage.completion_level === "human_accepted";
+  $("#delivery-development").classList.toggle("complete", verified || accepted);
+  $("#delivery-acceptance").classList.toggle("complete", accepted);
+  text("#delivery-title", accepted ? "当前阶段已经完成交付" : "项目仍在开发流程中");
+  text("#delivery-description", accepted ? "需求、开发、验证和人工验收记录都已保存，可以规划下一阶段。" : "完成当前阶段验证并由你亲自验收后，才会进入下一项交付工作。" );
+  renderDocuments(item.documents); renderActivity(item.activity);
+}
+
+function renderDocuments(documents) {
+  const root = $("#document-list"); root.replaceChildren();
+  for (const document of documents) {
+    const row = documentRow(document); root.append(row);
+  }
+}
+
+function documentRow(document) {
+  const row = window.document.createElement("button"); row.className = `document-row${document.exists ? "" : " missing"}`;
+  const icon = window.document.createElement("span"); icon.textContent = "MD";
+  const copy = window.document.createElement("div"); const title = window.document.createElement("b"); title.textContent = document.title;
+  const path = window.document.createElement("small"); path.textContent = document.path; copy.append(title, path);
+  const status = window.document.createElement("em"); status.textContent = document.exists ? "已就绪" : "未生成";
+  row.append(icon, copy, status); row.addEventListener("click", () => switchTab(document.id === "prd" ? "requirements" : document.id === "technical-adaptation" ? "plan" : "requirements")); return row;
+}
+
+function renderActivity(activity) {
+  const root = $("#activity-list"); root.replaceChildren();
+  if (!activity.length) { root.append(emptyMessage("项目刚刚创建，后续操作会记录在这里")); return; }
+  for (const item of activity.slice(0, 6)) {
+    const row = document.createElement("div"); row.className = "activity-row";
+    const dot = document.createElement("span"); dot.className = "activity-dot";
+    const copy = document.createElement("div"); const title = document.createElement("b"); title.textContent = activityLabel(item.type);
+    const meta = document.createElement("small"); meta.textContent = `${formatTime(item.created_at)} · 版本 ${item.revision}`; copy.append(title, meta); row.append(dot, copy); root.append(row);
+  }
+}
+
+function switchTab(tab) {
+  document.querySelectorAll("#project-tabs button").forEach((button) => button.classList.toggle("active", button.dataset.tab === tab));
+  document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("hidden", panel.dataset.panel !== tab));
 }
 
 function renderProgress(item) {
@@ -129,6 +254,8 @@ function renderAgentAvailability(item) {
   status.style.color = allowed ? "#26713c" : "#a06b19";
   $("#start-agent").disabled = !allowed;
   document.querySelectorAll("[data-open-agent]").forEach((button) => { button.disabled = !allowed; });
+  $("#plan-agent").disabled = !allowed;
+  $("#development-agent").disabled = !allowed;
 }
 
 function actionCard(title, description) {
@@ -259,6 +386,9 @@ async function refreshRun() {
 
 function labelState(value) { return ({ initialized: "已初始化", inputs_checked: "输入已确认", adaptation_pending_approval: "等待技术审批", stage_development: "阶段开发", system_verification: "系统验证", human_acceptance_pending: "等待人工验收", next_stage_or_frontend: "里程碑完成" })[value] || value; }
 function labelCompletion(value) { return ({ none: "尚未实现", implemented: "已实现", system_verified: "系统已验证", human_accepted: "人工已验收" })[value] || value; }
+function progressPercent(value) { return ({ initialized: 8, inputs_checked: 22, adaptation_pending_approval: 34, stage_development: 52, system_verification: 72, human_acceptance_pending: 88, next_stage_or_frontend: 100 })[value] || 5; }
+function activityLabel(value) { return ({ inputs_checked: "项目输入已确认", approval_requested: "发起人工确认", approval_consumed: "人工确认已记录", implementation_recorded: "开发实现已完成", evidence_recorded: "验证证据已登记", system_verified: "系统验证已通过", technical_adaptation: "技术方案已批准", stage_acceptance: "阶段验收已批准" })[value] || value.replaceAll("_", " "); }
+function formatTime(value) { if (!value) return "刚刚"; const date = new Date(value); return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date); }
 
 function openCreate() { $("#create-error").classList.add("hidden"); $("#create-dialog").showModal(); }
 function closeCreate() { $("#create-dialog").close(); }
@@ -285,6 +415,8 @@ async function createProject(event) {
 
 $("#new-project").addEventListener("click", openCreate);
 $("#empty-create").addEventListener("click", openCreate);
+$("#dashboard-create").addEventListener("click", openCreate);
+$("#home-link").addEventListener("click", showDashboard);
 $("#close-dialog").addEventListener("click", closeCreate);
 $("#cancel-create").addEventListener("click", closeCreate);
 $("#close-agent").addEventListener("click", closeAgent);
@@ -294,5 +426,10 @@ $("#start-agent").addEventListener("click", startAgent);
 $("#refresh-run").addEventListener("click", refreshRun);
 $("#project-path").addEventListener("click", () => copyPath(state.current?.path || "", "项目路径已复制"));
 $("#workspace-button").addEventListener("click", () => copyPath(state.config?.workspace || "", "工作区路径已复制"));
+document.querySelectorAll("#project-tabs button").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
+document.querySelectorAll("[data-go-tab]").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.goTab)));
+$("#plan-agent").addEventListener("click", () => openAgent("阅读 PRD 和项目资料，生成 docs/technical-adaptation.md。用产品负责人能理解的语言说明技术路线、前后端边界、数据存储、主要风险、费用与安全边界、测试和验收方法。不要推进状态或替我审批。"));
+$("#development-agent").addEventListener("click", () => openAgent("完成当前阶段的开发任务。严格依据 inputs/PRD.md 和已批准的 docs/technical-adaptation.md，实现、测试并进行浏览器验证。不要推进产品工厂状态，不要替我验收或部署。"));
+$("#copy-prd").addEventListener("click", () => copyPath($("#prd-content").textContent, "PRD 内容已复制"));
 
 Promise.all([loadConfig(), loadProjects()]).catch((error) => showToast(error.message));

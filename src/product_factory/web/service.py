@@ -34,6 +34,7 @@ from product_factory.services.recovery import repair_audit, resume_project, vali
 from product_factory.services.workflow import WorkflowService
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
+from product_factory.storage.files import read_contained_regular_bytes
 
 
 class AgentRunManager:
@@ -171,19 +172,26 @@ class ConsoleService:
             if is_managed:
                 candidate = Path(root)
                 try:
-                    snapshot = self.snapshot(candidate)
+                    repo = ProjectRepository(candidate)
+                    project = repo.load_project()
+                    state = repo.load_state()
+                    validation = validate_project(candidate)
                 except (FactoryError, OSError, ValueError):
                     continue
-                projects.append(
+                projects.append(_normalise(
                     {
                         "path": str(candidate.resolve()),
-                        "project_id": snapshot["project"]["project_id"],
-                        "name": snapshot["project"]["name"],
-                        "workflow_state": snapshot["state"]["workflow_state"],
-                        "revision": snapshot["state"]["revision"],
-                        "valid": snapshot["validation"]["valid"],
+                        "project_id": project.project_id,
+                        "name": project.name,
+                        "workflow_state": state.workflow_state,
+                        "revision": state.revision,
+                        "current_stage": state.current_stage,
+                        "waiting_on": state.waiting_on,
+                        "updated_at": state.updated_at,
+                        "valid": validation.valid,
+                        "agent_run": self.agent_runs.latest_for(candidate),
                     }
-                )
+                ))
                 directories[:] = []
         return sorted(projects, key=lambda item: (item["name"], item["path"]))
 
@@ -248,6 +256,35 @@ class ConsoleService:
         validation = validate_project(root)
         recovery = resume_project(root)
         lock = LockManager(root).status()
+        events = repo.read_events()
+        approvals = repo.read_approvals()
+        activity = [
+            {
+                "kind": "event",
+                "type": event.event_type,
+                "created_at": event.created_at,
+                "revision": event.after_revision,
+                "details": event.details,
+            }
+            for event in events
+        ] + [
+            {
+                "kind": "approval",
+                "type": approval.gate_type.value,
+                "created_at": approval.created_at,
+                "revision": approval.consumed_by_revision,
+                "details": {"actor": approval.actor, "scope": approval.scope},
+            }
+            for approval in approvals
+        ]
+        activity.sort(key=lambda item: item["created_at"], reverse=True)
+        documents = [
+            self._document(root, "prd", "产品需求文档", ("inputs", "PRD.md")),
+            self._document(
+                root, "technical-adaptation", "技术适配方案", ("docs", "technical-adaptation.md")
+            ),
+            self._document(root, "constraints", "项目约束", ("inputs", "constraints.md")),
+        ]
         return _normalise(
             {
                 "path": root,
@@ -257,8 +294,51 @@ class ConsoleService:
                 "recovery": recovery,
                 "lock": lock,
                 "agent_run": self.agent_runs.latest_for(root),
+                "documents": documents,
+                "activity": activity[:30],
+                "stats": {
+                    "events": len(events),
+                    "approvals": len(approvals),
+                    "evidence": self._evidence_count(root),
+                },
             }
         )
+
+    @staticmethod
+    def _document(root: Path, identifier: str, title: str, parts: tuple[str, ...]) -> dict[str, Any]:
+        try:
+            content = read_contained_regular_bytes(root, parts)
+            decoded = content.decode("utf-8")
+            return {
+                "id": identifier,
+                "title": title,
+                "path": "/".join(parts),
+                "exists": True,
+                "content": decoded[:100_000],
+                "truncated": len(decoded) > 100_000,
+            }
+        except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
+            return {
+                "id": identifier,
+                "title": title,
+                "path": "/".join(parts),
+                "exists": False,
+                "content": "",
+                "truncated": False,
+            }
+
+    @staticmethod
+    def _evidence_count(root: Path) -> int:
+        evidence_root = root / ".product-factory" / "evidence"
+        count = 0
+        try:
+            for current, directories, files in os.walk(evidence_root, followlinks=False):
+                directories[:] = [name for name in directories if not name.startswith(".")]
+                if "manifest.json" in files and (Path(current) / "manifest.json").is_file():
+                    count += 1
+        except OSError:
+            return 0
+        return count
 
     def perform_action(self, project_path: Path | str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         root = self.resolve_project_path(str(project_path), require_managed=True)

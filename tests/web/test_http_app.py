@@ -36,8 +36,14 @@ def test_http_api_requires_token_and_serves_dashboard(tmp_path: Path) -> None:
         status, content_type, body = _request(server, "GET", "/")
         assert status == 200
         assert content_type.startswith("text/html")
-        assert "产品工厂" in body.decode("utf-8")
-        assert "test-token" not in body.decode("utf-8")
+        dashboard = body.decode("utf-8")
+        assert "产品工厂" in dashboard
+        assert "所有项目" in dashboard
+        assert "待你处理" in dashboard
+        assert "总览" in dashboard
+        assert "技术方案" in dashboard
+        assert "开发工作区" in dashboard
+        assert "test-token" not in dashboard
 
         status, _, body = _request(server, "GET", "/api/config")
         assert status == 403

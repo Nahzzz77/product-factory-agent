@@ -37,6 +37,10 @@ def test_create_list_snapshot_and_check_inputs(tmp_path: Path) -> None:
     created = _create(service)
     assert created["project"]["project_id"] == "demo"
     assert created["state"]["workflow_state"] == "initialized"
+    assert created["documents"][0]["id"] == "prd"
+    assert created["documents"][0]["exists"] is True
+    assert "离线" in created["documents"][0]["content"]
+    assert created["stats"] == {"events": 0, "approvals": 0, "evidence": 0}
     assert [item["project_id"] for item in service.list_projects()] == ["demo"]
 
     checked = service.perform_action(tmp_path / "demo", "check_inputs", {})
@@ -44,6 +48,7 @@ def test_create_list_snapshot_and_check_inputs(tmp_path: Path) -> None:
     assert checked["state"]["revision"] == 1
     assert checked["lock"] is None
     assert checked["validation"]["valid"] is True
+    assert checked["activity"][0]["type"] == "inputs_checked"
     assert not (tmp_path / "demo" / ".product-factory" / "execution-lock.json").exists()
 
 
