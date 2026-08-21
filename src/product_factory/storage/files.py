@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import stat
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -211,6 +212,7 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     rollback = path.parent / f".{path.name}.{uuid.uuid4().hex}.rollback"
     descriptor: int | None = None
+    preserve_rollback = False
     try:
         if existed:
             _write_fsynced_file(rollback, previous)
@@ -228,8 +230,13 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
                     os.replace(rollback, path)
                 else:
                     path.unlink()
-                _fsync_parent_directory(path)
             except BaseException as rollback_error:
+                # ``os.replace`` either consumes the scratch file or leaves it
+                # in place.  On the latter path it is the only durable copy of
+                # the old complete log, so deliberately leave it for manual
+                # recovery instead of treating it as disposable cleanup.
+                if existed:
+                    preserve_rollback = True
                 raise FactoryError(
                     "audit_rollback_failed",
                     ErrorCategory.ENVIRONMENT_BLOCKED,
@@ -240,16 +247,66 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
                     {
                         "original_errno": original.errno,
                         "rollback_error": type(rollback_error).__name__,
+                        "rollback_path": rollback.name if existed else None,
                     },
                 ) from rollback_error
+            try:
+                _fsync_parent_directory(path)
+            except BaseException as rollback_sync_error:
+                # The replacement above has already restored the canonical
+                # bytes (and consumed the scratch file).  Report this as a
+                # durability failure rather than claiming that a backup can
+                # still be recovered from a path that no longer exists.
+                raise FactoryError(
+                    "audit_rollback_fsync_failed",
+                    ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "审计日志已恢复原记录，但恢复操作未能同步到目录",
+                    "append_jsonl",
+                    True,
+                    "检查存储后重试操作",
+                    {
+                        "original_errno": original.errno,
+                        "rollback_error": type(rollback_sync_error).__name__,
+                    },
+                ) from rollback_sync_error
             raise original
     finally:
+        cleanup_error: OSError | None = None
+        cleanup_path: str | None = None
         if descriptor is not None:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-        # A successfully restored rollback file has already been moved into
-        # place.  This cleanup only removes unused scratch records.
-        rollback.unlink(missing_ok=True)
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                cleanup_error = exc
+                cleanup_path = temporary.name
+        for scratch in (temporary,):
+            try:
+                scratch.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+                cleanup_path = cleanup_path or scratch.name
+        if not preserve_rollback:
+            try:
+                # A successfully restored rollback file has already been
+                # consumed by os.replace.  This removes only unused scratch
+                # records, including failures before publication.
+                rollback.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+                cleanup_path = cleanup_path or rollback.name
+        # Never replace an original publish/rollback failure with a best-effort
+        # cleanup error.  A clean success, however, reports cleanup trouble in
+        # a stable protocol envelope so operators can inspect the scratch path.
+        if sys.exc_info()[0] is None and cleanup_error is not None:
+            raise FactoryError(
+                "audit_cleanup_failed",
+                ErrorCategory.ENVIRONMENT_BLOCKED,
+                "审计日志已写入，但临时文件清理失败",
+                "append_jsonl",
+                True,
+                "检查项目目录中的临时文件后重试",
+                {"cleanup_error": type(cleanup_error).__name__, "cleanup_path": cleanup_path},
+            ) from cleanup_error
 
 
 def _write_fsynced_file(path: Path, content: bytes) -> None:

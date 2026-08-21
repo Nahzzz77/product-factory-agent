@@ -154,8 +154,13 @@ def test_resume_reports_missing_audit_event_without_repairing(tmp_path: Path) ->
     root = _root(tmp_path)
     repo = ProjectRepository(root)
     current = repo.load_state()
-    # Mimic the state-first crash point without appending the reserved event.
-    repo.save_state(current.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
+    # Mimic the state-first crash point after the inputs-checked transition
+    # committed state and reserved an event id, but before the append.
+    repo.save_state(current.model_copy(update={
+        "revision": 1,
+        "workflow_state": WorkflowState.INPUTS_CHECKED,
+        "last_event_id": "lost-event",
+    }), 0)
     before = _snapshot(root)
     summary = resume_project(root)
     assert summary.audit_status == "missing_referenced_event"
@@ -175,6 +180,28 @@ def test_v1_initialized_revision_one_with_a_real_event_is_invalid(tmp_path: Path
         before_revision=0, after_revision=1, created_at=datetime.now(timezone.utc), details={},
     ))
     assert "workflow_revision_invalid" in validate_project(root).findings
+
+
+@pytest.mark.parametrize("with_event", [False, True])
+def test_initialized_revision_one_is_never_repairable(tmp_path: Path, with_event: bool) -> None:
+    from product_factory.services.recovery import repair_audit, resume_project, validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state().model_copy(update={"revision": 1, "last_event_id": "event-01"})
+    atomic_write_json(repo.paths.state, state.model_dump(mode="json"))
+    if with_event:
+        repo.append_event(EventRecord(
+            schema_version="1.0", event_id="event-01", event_type="inputs_checked", project_id=state.project_id,
+            before_revision=0, after_revision=1, created_at=datetime.now(timezone.utc), details={},
+        ))
+    report = validate_project(root)
+    assert "workflow_revision_invalid" in report.findings
+    assert resume_project(root).next_command == "product-factory validate"
+    lock_id = _lock(root, 1)
+    with pytest.raises(FactoryError) as caught:
+        repair_audit(root, lock_id, 1)
+    assert caught.value.code == "audit_repair_unsafe"
 
 
 def test_v1_state_must_stay_on_the_first_stage(tmp_path: Path) -> None:
@@ -205,7 +232,11 @@ def test_resume_never_recommends_repair_when_the_audit_log_is_damaged(tmp_path: 
     root = _root(tmp_path)
     repo = ProjectRepository(root)
     state = repo.load_state()
-    repo.save_state(state.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
+    repo.save_state(state.model_copy(update={
+        "revision": 1,
+        "workflow_state": WorkflowState.INPUTS_CHECKED,
+        "last_event_id": "lost-event",
+    }), 0)
     repo.paths.events.write_text("{partial", encoding="utf-8")
     summary = resume_project(root)
     assert summary.audit_status == "invalid"
@@ -403,16 +434,21 @@ def test_repair_appends_only_the_referenced_event_and_retries_are_singleton(tmp_
     root = _root(tmp_path)
     repo = ProjectRepository(root)
     state = repo.load_state()
-    repo.save_state(state.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
+    repo.save_state(state.model_copy(update={
+        "revision": 1,
+        "workflow_state": WorkflowState.INPUTS_CHECKED,
+        "last_event_id": "lost-event",
+    }), 0)
     before_state = repo.paths.state.read_bytes()
+    assert validate_project(root).findings == ["missing_referenced_event"]
     lock_id = _lock(root, 1)
     event = repair_audit(root, lock_id, 1)
     assert event.event_id == "lost-event"
     assert repo.paths.state.read_bytes() == before_state
     assert [record.event_id for record in repo.read_events()] == ["lost-event"]
     report = validate_project(root)
-    assert report.valid is False
-    assert report.findings == ["workflow_revision_invalid"]
+    assert report.valid is True
+    assert report.findings == []
     with pytest.raises(FactoryError) as caught:
         repair_audit(root, lock_id, 1)
     assert caught.value.code == "audit_repair_not_needed"
@@ -424,7 +460,11 @@ def test_repair_requires_current_lock_and_never_appends_after_malformed_tail(tmp
     root = _root(tmp_path)
     repo = ProjectRepository(root)
     state = repo.load_state()
-    repo.save_state(state.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
+    repo.save_state(state.model_copy(update={
+        "revision": 1,
+        "workflow_state": WorkflowState.INPUTS_CHECKED,
+        "last_event_id": "lost-event",
+    }), 0)
     with pytest.raises(FactoryError) as caught:
         repair_audit(root, "missing-lock", 1)
     assert caught.value.code == "lock_required"

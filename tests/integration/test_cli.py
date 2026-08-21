@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from product_factory.domain.approvals import APPROVAL_STATEMENT
+from product_factory.contracts.models import WorkflowState
 from product_factory.storage.repository import ProjectRepository
 
 
@@ -175,7 +176,11 @@ def test_cli_repair_audit_lock_takeover_and_rejects_invalid_stage_without_secret
     )
     repo = ProjectRepository(root)
     initial = repo.load_state()
-    repo.save_state(initial.model_copy(update={"revision": 1, "last_event_id": "lost-event"}), 0)
+    repo.save_state(initial.model_copy(update={
+        "revision": 1,
+        "workflow_state": WorkflowState.INPUTS_CHECKED,
+        "last_event_id": "lost-event",
+    }), 0)
     lock = _acquire(root, 1, "repair")
     repaired = _run_json(
         "repair-audit", "--project", str(root), "--lock-id", lock, "--expected-revision", "1",
@@ -201,8 +206,8 @@ def test_cli_repair_audit_lock_takeover_and_rejects_invalid_stage_without_secret
     assert takeover_events[0].details["old_lock_id"] == lock
     assert takeover_events[0].details["new_lock_id"] == takeover["details"]["lock"]["lock_id"]
     validated = run_cli("--json", "validate", "--project", str(root))
-    assert validated.returncode == 2
-    assert json.loads(validated.stdout)["details"]["findings"] == ["workflow_revision_invalid"]
+    assert validated.returncode == 0
+    assert json.loads(validated.stdout)["details"]["findings"] == []
     _release(root, takeover["details"]["lock"]["lock_id"])
 
 

@@ -167,6 +167,8 @@ def repair_audit(root: Path, lock_id: str, expected_revision: int) -> EventRecor
         # itself the active, validated lease holder.
         report = _collect_validation(root)
         if "missing_referenced_event" not in report.findings:
+            if report.findings:
+                raise _repair_unsafe(report.findings)
             raise _repair_not_needed()
         if not _only_repairable_audit_gap(report.findings):
             raise _repair_unsafe(report.findings)
@@ -329,16 +331,7 @@ def _validate_workflow_invariants(
         WorkflowState.NEXT_STAGE_OR_FRONTEND: {7},
     }
     expected_revisions = v1_revisions.get(state.workflow_state)
-    # A state-first crash can leave exactly the next revision and its reserved
-    # event id before the append.  Let the audit collector report that one
-    # repairable gap alone; once the event is present, the same V1 state is an
-    # impossible edited record and is reported below by _validate_events.
-    state_first_audit_gap = (
-        state.workflow_state is WorkflowState.INITIALIZED
-        and state.revision == 1
-        and state.last_event_id is not None
-    )
-    if expected_revisions is not None and state.revision not in expected_revisions and not state_first_audit_gap:
+    if expected_revisions is not None and state.revision not in expected_revisions:
         _add(findings, "workflow_revision_invalid")
     if expected_revisions is not None and project is not None:
         first = project.stage_plan[0]
@@ -401,8 +394,6 @@ def _validate_events(
     if referenced is None:
         _add(findings, "missing_referenced_event")
         return
-    if state.workflow_state is WorkflowState.INITIALIZED and state.revision == 1:
-        _add(findings, "workflow_revision_invalid")
     if referenced.after_revision != state.revision:
         _add(findings, "referenced_event_revision_mismatch")
     for event in events:
