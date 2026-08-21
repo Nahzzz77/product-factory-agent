@@ -46,6 +46,9 @@ def test_http_api_requires_token_and_serves_dashboard(tmp_path: Path) -> None:
         assert "prd-file" in dashboard
         assert "run-history" in dashboard
         assert "cancel-run" in dashboard
+        assert 'href="./app.css"' in dashboard
+        assert 'src="./app.js"' in dashboard
+        assert "direct-open-notice" in dashboard
         assert "test-token" not in dashboard
 
         status, _, body = _request(server, "GET", "/api/config")

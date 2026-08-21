@@ -305,3 +305,25 @@ dialog { border-radius: 24px; color: var(--ink); box-shadow: 0 0 0 1px #0000000d
 @media (max-width: 430px) {
   .dashboard-metrics { grid-template-columns: 1fr; }.dashboard-heading h1, .empty-view h1 { font-size: 43px; }.topbar { padding: 0 16px; }
 }
+
+.direct-open-notice { display: none; }
+.direct-file-open { min-height: 100vh; background: radial-gradient(circle at 70% 35%, #fbe1d1 0, #fbe1d188 18%, transparent 48%), #fff; }
+.direct-file-open .app-shell, .direct-file-open dialog, .direct-file-open #toast { display: none !important; }
+.direct-file-open .direct-open-notice {
+  width: min(900px, calc(100% - 40px)); min-height: 100vh; margin: 0 auto; padding: 12vh 0 80px;
+  display: flex; flex-direction: column; justify-content: center; align-items: flex-start;
+}
+.direct-open-mark { width: 54px; height: 54px; position: relative; margin-bottom: 44px; border-radius: 50%; background: var(--ink); }
+.direct-open-mark:before { content: ""; position: absolute; inset: 15px 11px 13px; border: 3px solid white; border-bottom-color: transparent; border-radius: 50%; transform: rotate(-18deg); }
+.direct-open-mark span { position: absolute; inset: 24px; border-radius: 50%; background: white; }
+.direct-open-notice h1 { max-width: 850px; margin: 0; font: 400 clamp(46px, 6vw, 78px)/1.04 var(--serif); letter-spacing: -.045em; }
+.direct-open-notice h1 em { color: var(--brown); font-weight: 400; }
+.direct-open-notice > p:not(.kicker) { max-width: 700px; margin: 28px 0; color: #555960; font-size: 17px; line-height: 1.65; }
+.direct-open-path { width: min(620px, 100%); display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 22px; border-radius: 16px; color: var(--brown); background: var(--peach); }
+.direct-open-path span { font-size: 12px; }.direct-open-path code { color: var(--ink); font: 500 14px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.direct-open-notice > small { margin-top: 16px; color: #777b86; font-size: 12px; }
+@media (max-width: 600px) {
+  .direct-file-open .direct-open-notice { width: min(100% - 32px, 900px); padding-top: 64px; justify-content: flex-start; }
+  .direct-open-notice h1 { font-size: 46px; }.direct-open-notice > p:not(.kicker) { font-size: 15px; }
+  .direct-open-path { align-items: flex-start; flex-direction: column; }.direct-open-path code { overflow-wrap: anywhere; }
+}

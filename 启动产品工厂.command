@@ -4,6 +4,8 @@ set -u
 
 launcher_dir=${0:A:h}
 workspace_dir=${PRODUCT_FACTORY_WORKSPACE:-"$HOME/ProductFactoryProjects"}
+workspace_port=${PRODUCT_FACTORY_PORT:-8765}
+no_open=${PRODUCT_FACTORY_NO_OPEN:-0}
 executable="$launcher_dir/.venv/bin/product-factory"
 
 if [[ ! -x "$executable" ]]; then
@@ -28,7 +30,11 @@ echo "项目保存位置：$workspace_dir"
 echo "关闭本窗口即可停止本地服务。"
 echo ""
 
-"$executable" web --workspace "$workspace_dir"
+launcher_args=(web --workspace "$workspace_dir" --port "$workspace_port")
+if [[ "$no_open" == "1" ]]; then
+  launcher_args+=(--no-open)
+fi
+"$executable" "${launcher_args[@]}"
 exit_code=$?
 
 if (( exit_code != 0 )); then

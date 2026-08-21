@@ -514,4 +514,9 @@ $("#plan-agent").addEventListener("click", () => openAgent("阅读 PRD 和项目
 $("#development-agent").addEventListener("click", () => openAgent("完成当前阶段的开发任务。严格依据 inputs/PRD.md 和已批准的 docs/technical-adaptation.md，实现、测试并进行浏览器验证。不要推进产品工厂状态，不要替我验收或部署。"));
 $("#copy-prd").addEventListener("click", () => copyPath($("#prd-content").textContent, "PRD 内容已复制"));
 
-Promise.all([loadConfig(), loadProjects()]).catch((error) => showToast(error.message));
+if (window.location.protocol === "file:") {
+  document.body.classList.add("direct-file-open");
+  $("#direct-open-notice").classList.remove("hidden");
+} else {
+  Promise.all([loadConfig(), loadProjects()]).catch((error) => showToast(error.message));
+}
