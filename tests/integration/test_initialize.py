@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 import hashlib
+import os
 from pathlib import Path
 from threading import Event, Thread
 
@@ -492,6 +493,19 @@ def test_check_inputs_reports_a_prd_digest_mismatch(tmp_path: Path) -> None:
     assert caught.value.details == {"errors": ["prd_digest_mismatch"]}
 
 
+@pytest.mark.skipif(os.name == "nt", reason="mkfifo is a POSIX probe")
+def test_check_inputs_rejects_prd_fifo_without_blocking(tmp_path: Path) -> None:
+    target = initialize(tmp_path)
+    prd = target / "inputs/PRD.md"
+    prd.unlink()
+    os.mkfifo(prd)
+
+    with pytest.raises(FactoryError) as caught:
+        check_inputs(target, lock_for_initial_state(target), expected_revision=0)
+
+    assert caught.value.code == "prd_unreadable"
+
+
 def test_check_inputs_accepts_reasoned_not_applicable_and_advances_state(tmp_path: Path) -> None:
     target = initialize(tmp_path, not_applicable="model_cost_platform")
 
@@ -500,6 +514,34 @@ def test_check_inputs_accepts_reasoned_not_applicable_and_advances_state(tmp_pat
     assert state.revision == 1
     assert state.workflow_state is WorkflowState.INPUTS_CHECKED
     assert ProjectRepository(target).read_events()[0].event_type == "inputs_checked"
+
+
+def test_check_inputs_never_reopens_a_later_workflow_state(tmp_path: Path) -> None:
+    target = initialize(tmp_path)
+    repo = ProjectRepository(target)
+    current = repo.load_state()
+    revision_one = current.model_copy(update={"revision": 1})
+    repo.save_state(revision_one, 0)
+    revision_two = revision_one.model_copy(update={"revision": 2})
+    repo.save_state(revision_two, 1)
+    advanced = revision_two.model_copy(update={
+        "revision": 3,
+        "workflow_state": WorkflowState.ADAPTATION_PENDING_APPROVAL,
+        "waiting_on": None,
+    })
+    repo.save_state(advanced, 2)
+    before_state = repo.paths.state.read_bytes()
+    before_events = repo.paths.events.read_bytes()
+    lock = LockManager(target).acquire(
+        LockOwner(tool="pytest", session_id="later", pid=1, host="local"), 3, timedelta(minutes=5)
+    )
+
+    with pytest.raises(FactoryError) as caught:
+        check_inputs(target, lock.lock_id, expected_revision=3)
+
+    assert caught.value.code == "transition_not_allowed"
+    assert repo.paths.state.read_bytes() == before_state
+    assert repo.paths.events.read_bytes() == before_events
 
 
 def test_check_inputs_rejects_whitespace_not_applicable_reason(tmp_path: Path) -> None:

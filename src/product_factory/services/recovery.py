@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 from product_factory.contracts.models import (
     ApprovalRecord,
     EventRecord,
+    GateType,
     IntakeRecord,
     ProjectRecord,
     StateRecord,
@@ -24,6 +25,8 @@ from product_factory.domain.evidence import evaluate_evidence
 from product_factory.domain.approvals import require_exact_approval
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.evidence import compute_source_digest
+from product_factory.services.initialize import read_prd_baseline_bytes
+from product_factory.storage.files import read_contained_regular_bytes
 from product_factory.storage.locks import LockManager
 from product_factory.storage.repository import ProjectRepository
 
@@ -72,11 +75,11 @@ def _collect_validation(root: Path) -> ValidationReport:
     """Collect business-record findings only; lock status is intentionally separate."""
     repo = ProjectRepository(root)
     findings: list[str] = []
-    project = _read_yaml_model(repo.paths.project, ProjectRecord, "project", findings)
-    intake = _read_yaml_model(repo.paths.intake, IntakeRecord, "intake", findings)
-    state = _read_json_model(repo.paths.state, StateRecord, "state", findings)
-    approvals = _read_jsonl_models(repo.paths.approvals, ApprovalRecord, "approval", findings)
-    events = _read_jsonl_models(repo.paths.events, EventRecord, "event", findings)
+    project = _read_yaml_model(root, repo.paths.project, ProjectRecord, "project", findings)
+    intake = _read_yaml_model(root, repo.paths.intake, IntakeRecord, "intake", findings)
+    state = _read_json_model(root, repo.paths.state, StateRecord, "state", findings)
+    approvals = _read_jsonl_models(root, repo.paths.approvals, ApprovalRecord, "approval", findings)
+    events = _read_jsonl_models(root, repo.paths.events, EventRecord, "event", findings)
 
     if project is not None and intake is not None and state is not None:
         if {project.project_id, intake.project_id, state.project_id} != {project.project_id}:
@@ -88,6 +91,10 @@ def _collect_validation(root: Path) -> ValidationReport:
             _add(findings, "unknown_current_stage")
         elif stage is not None and state.current_stage.sequence != stage.sequence:
             _add(findings, "current_stage_sequence_mismatch")
+    if project is not None:
+        _validate_prd(repo, project, findings)
+    if state is not None:
+        _validate_workflow_invariants(state, findings)
 
     _validate_approvals(approvals, state, findings)
     _validate_events(events, project, state, findings)
@@ -101,7 +108,7 @@ def resume_project(root: Path) -> RecoverySummary:
     root = _validated_root(root)
     report = _collect_validation(root)
     repo = ProjectRepository(root)
-    state = _read_json_model(repo.paths.state, StateRecord, "state", [])
+    state = _read_json_model(root, repo.paths.state, StateRecord, "state", [])
     lock_status = _lock_status(root)
     audit_status = _audit_status(report.findings)
     evidence_status = _evidence_status(report.findings, state)
@@ -116,7 +123,9 @@ def resume_project(root: Path) -> RecoverySummary:
             next_command="product-factory validate",
         )
     next_command = NEXT_COMMAND.get(state.workflow_state, "product-factory validate")
-    if lock_status == "invalid":
+    if any(finding in {"prd_path_invalid", "prd_unreadable", "prd_digest_mismatch"} for finding in report.findings):
+        next_command = "product-factory validate"
+    elif lock_status == "invalid":
         next_command = "product-factory validate"
     elif lock_status == "active":
         # A lease belongs to another session from this read-only process.
@@ -175,7 +184,7 @@ def repair_audit(root: Path, lock_id: str, expected_revision: int) -> EventRecor
             details={"workflow_state": state.workflow_state.value},
         )
         repo.append_event(event)
-        if repo.paths.state.read_bytes() != before:
+        if _read_protocol_bytes(root, repo.paths.state) != before:
             raise RuntimeError("repair_audit changed state.json")
         return event
 
@@ -198,9 +207,9 @@ def _validated_root(root: Path) -> Path:
         ) from exc
 
 
-def _read_yaml_model(path: Path, model: type[_Model], label: str, findings: list[str]) -> _Model | None:
+def _read_yaml_model(root: Path, path: Path, model: type[_Model], label: str, findings: list[str]) -> _Model | None:
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        payload = yaml.safe_load(_read_protocol_bytes(root, path).decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("expected mapping")
         return model.model_validate(payload)
@@ -209,27 +218,27 @@ def _read_yaml_model(path: Path, model: type[_Model], label: str, findings: list
         return None
 
 
-def _read_json_model(path: Path, model: type[_Model], label: str, findings: list[str]) -> _Model | None:
+def _read_json_model(root: Path, path: Path, model: type[_Model], label: str, findings: list[str]) -> _Model | None:
     try:
-        return model.model_validate_json(path.read_text(encoding="utf-8"))
+        return model.model_validate_json(_read_protocol_bytes(root, path))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError, TypeError):
         _add(findings, f"{label}_invalid")
         return None
 
 
 def _read_jsonl_models(
-    path: Path, model: type[_Model], label: str, findings: list[str]
+    root: Path, path: Path, model: type[_Model], label: str, findings: list[str]
 ) -> list[_Model]:
-    records, issues = _read_jsonl_models_safely(path, model)
+    records, issues = _read_jsonl_models_safely(root, path, model)
     for issue in issues:
         _add(findings, f"{label}_invalid:{issue}")
     return records
 
 
-def _read_jsonl_models_safely(path: Path, model: type[_Model]) -> tuple[list[_Model], list[str]]:
+def _read_jsonl_models_safely(root: Path, path: Path, model: type[_Model]) -> tuple[list[_Model], list[str]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        lines = _read_protocol_bytes(root, path).decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError, ValueError):
         return [], ["file"]
     records: list[_Model] = []
     issues: list[str] = []
@@ -240,6 +249,34 @@ def _read_jsonl_models_safely(path: Path, model: type[_Model]) -> tuple[list[_Mo
         except (json.JSONDecodeError, ValidationError, ValueError, TypeError):
             issues.append(f"line:{number}")
     return records, issues
+
+
+def _read_protocol_bytes(root: Path, path: Path) -> bytes:
+    return read_contained_regular_bytes(root, path.relative_to(root).parts)
+
+
+def _validate_prd(repo: ProjectRepository, project: ProjectRecord, findings: list[str]) -> None:
+    try:
+        baseline = read_prd_baseline_bytes(repo, project, "validate")
+    except FactoryError as exc:
+        _add(findings, exc.code)
+        return
+    import hashlib
+    if hashlib.sha256(baseline).hexdigest() != project.prd.sha256:
+        _add(findings, "prd_digest_mismatch")
+
+
+def _validate_workflow_invariants(state: StateRecord, findings: list[str]) -> None:
+    waiting = state.waiting_on
+    expected_gate = {
+        WorkflowState.ADAPTATION_PENDING_APPROVAL: GateType.TECHNICAL_ADAPTATION,
+        WorkflowState.HUMAN_ACCEPTANCE_PENDING: GateType.STAGE_ACCEPTANCE,
+    }.get(state.workflow_state)
+    if expected_gate is None:
+        if waiting is not None:
+            _add(findings, "waiting_on_invalid_for_workflow_state")
+    elif waiting is None or waiting.gate_type is not expected_gate:
+        _add(findings, "waiting_on_gate_mismatch")
 
 
 def _validate_approvals(
@@ -441,15 +478,15 @@ def _only_repairable_audit_gap(findings: list[str]) -> bool:
 
 def _event_revision_is_valid(event: EventRecord) -> bool:
     """A repair event records an already-committed state, so it has no delta."""
-    if event.event_type == "recovered_missing_event":
+    if event.event_type in {"recovered_missing_event", "lock_taken_over"}:
         return event.after_revision == event.before_revision
     return event.after_revision == event.before_revision + 1
 
 
 def _read_state_bytes(repo: ProjectRepository) -> bytes:
     try:
-        return repo.paths.state.read_bytes()
-    except OSError as exc:
+        return _read_protocol_bytes(repo.paths.root, repo.paths.state)
+    except (OSError, ValueError) as exc:
         raise _repair_unsafe(["state_invalid"]) from exc
 
 

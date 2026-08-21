@@ -14,6 +14,7 @@ import yaml
 from pydantic import ValidationError
 
 from product_factory.contracts.models import CompletionLevel, EvidenceManifest, ProjectRecord, StateRecord, WorkflowState
+from product_factory.contracts.identifiers import is_portable_path_component
 from product_factory.domain.evidence import evaluate_evidence
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.storage.files import read_contained_regular_bytes
@@ -65,6 +66,7 @@ def record_evidence(
         repo = ProjectRepository(root)
         project, state = _current_context(repo, expected_revision, "record_evidence")
         _require_recordable_state(state)
+        _require_current_prd(repo, project, "record_evidence")
         authored = _load_authoring(root, authoring_path)
         manifest = authored.model_copy(
             update={
@@ -86,6 +88,7 @@ def verify_stage(root: Path, evidence_id: str, lock_id: str, expected_revision: 
     with manager.mutation(lock_id, expected_revision):
         repo = ProjectRepository(root)
         project, state = _current_context(repo, expected_revision, "verify_stage")
+        _require_current_prd(repo, project, "verify_stage")
         try:
             manifest = repo.load_evidence(state.current_stage.id, evidence_id)
         except (FileNotFoundError, OSError, ValueError, ValidationError) as exc:
@@ -124,6 +127,7 @@ def evidence_current(
     repo: ProjectRepository, project: ProjectRecord, state: StateRecord, evidence_id: str
 ) -> bool:
     """Return whether an existing manifest still matches project facts right now."""
+    _require_current_prd(repo, project, "evidence_current")
     try:
         manifest = repo.load_evidence(state.current_stage.id, evidence_id)
     except (FileNotFoundError, OSError, ValueError, ValidationError, FactoryError):
@@ -187,7 +191,11 @@ def _load_authoring(root: Path, supplied: Path) -> EvidenceManifest:
             payload = yaml.safe_load(decoded)
         if not isinstance(payload, dict):
             raise ValueError("evidence authoring must be a mapping")
+        if not is_portable_path_component(payload.get("evidence_id")):
+            raise _evidence_identifier_invalid()
         return EvidenceManifest.model_validate(payload)
+    except FactoryError:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
         raise FactoryError(
             "evidence_authoring_invalid",
@@ -197,6 +205,21 @@ def _load_authoring(root: Path, supplied: Path) -> EvidenceManifest:
             False,
             "修正项目内的 YAML 或 JSON 证据清单后重试",
         ) from exc
+
+
+def _require_current_prd(repo: ProjectRepository, project: ProjectRecord, step: str) -> bytes:
+    # This import remains local to keep initialization's dependencies one-way.
+    from product_factory.services.initialize import require_current_prd
+
+    return require_current_prd(repo, project, step)
+
+
+def _evidence_identifier_invalid() -> FactoryError:
+    return FactoryError(
+        "evidence_identifier_invalid", ErrorCategory.INPUT_REQUIRED,
+        "证据 ID 必须是跨平台安全的单个文件名", "record_evidence", False,
+        "使用不含保留名、路径分隔符或 Windows 非法字符的新 evidence_id",
+    )
 
 
 def _authoring_relative_path(root: Path, supplied: Path) -> PurePosixPath:

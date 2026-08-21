@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -86,12 +88,50 @@ def test_validation_collects_each_bad_record_without_stopping(tmp_path: Path) ->
     ]
 
 
+def test_validation_rejects_illegal_waiting_on_and_changed_prd(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state()
+    repo.save_state(state.model_copy(update={
+        "revision": 1,
+        "waiting_on": WaitingOn(
+            type="approval", request_id="bad", gate_type=GateType.TECHNICAL_ADAPTATION, scope={}
+        ),
+    }), 0)
+    (root / "inputs/PRD.md").write_text("# changed\n", encoding="utf-8")
+
+    report = validate_project(root)
+    assert "waiting_on_invalid_for_workflow_state" in report.findings
+    assert "prd_digest_mismatch" in report.findings
+    assert resume_project(root).next_command == "product-factory validate"
+
+
 def test_missing_project_root_raises_stable_factory_error(tmp_path: Path) -> None:
     from product_factory.services.recovery import validate_project
 
     with pytest.raises(FactoryError) as caught:
         validate_project(tmp_path / "missing")
     assert caught.value.code == "project_unreadable"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="mkfifo is a POSIX probe")
+def test_recovery_never_blocks_on_a_state_fifo(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    state = root / ".product-factory/state.json"
+    state.unlink()
+    os.mkfifo(state)
+    result: list[object] = []
+    worker = Thread(target=lambda: result.append((validate_project(root), resume_project(root))))
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    report, summary = result[0]
+    assert "state_invalid" in report.findings
+    assert summary.workflow_state == "unknown"
 
 
 def test_resume_reports_missing_audit_event_without_repairing(tmp_path: Path) -> None:

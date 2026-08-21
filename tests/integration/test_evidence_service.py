@@ -130,6 +130,37 @@ def _authoring(
     return path
 
 
+def test_prd_baseline_must_remain_current_for_record_and_verify(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    authoring = _authoring(root)
+    original = (root / "inputs/PRD.md").read_bytes()
+    (root / "inputs/PRD.md").write_bytes(b"# changed\n")
+    lock = _lock(root, 4)
+    with pytest.raises(FactoryError) as caught:
+        record_evidence(root, authoring, lock.lock_id, 4)
+    assert caught.value.code == "prd_digest_mismatch"
+    assert validate_project(root).valid is False
+    assert "prd_digest_mismatch" in validate_project(root).findings
+    assert resume_project(root).next_command == "product-factory validate"
+    (root / "inputs/PRD.md").write_bytes(original)
+    manifest = record_evidence(root, authoring, lock.lock_id, 4)
+    (root / "inputs/PRD.md").write_bytes(b"# changed again\n")
+    with pytest.raises(FactoryError) as verify_error:
+        verify_stage(root, manifest.evidence_id, lock.lock_id, 4)
+    assert verify_error.value.code == "prd_digest_mismatch"
+
+
+@pytest.mark.parametrize("evidence_id", ["CON", "con.txt", "evidence:01", "name.", "trailing "])
+def test_record_evidence_reports_invalid_portable_id_stably(tmp_path: Path, evidence_id: str) -> None:
+    root = _root(tmp_path)
+    lock = _lock(root, 4)
+    with pytest.raises(FactoryError) as caught:
+        record_evidence(root, _authoring(root, evidence_id=evidence_id), lock.lock_id, 4)
+    assert caught.value.code == "evidence_identifier_invalid"
+
+
 def _record(root: Path, authoring: Path):
     lock = _lock(root, 4)
     try:

@@ -100,6 +100,29 @@
       "type": "array"
     },
     "evidence_id": {
+      "allOf": [
+        {
+          "not": {
+            "enum": [
+              ".",
+              ".."
+            ]
+          }
+        },
+        {
+          "not": {
+            "pattern": "[. ]$"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^(?i:(con|prn|aux|nul|com[1-9]|lpt[1-9]))(?:\\..*)?$"
+          }
+        }
+      ],
+      "maxLength": 255,
+      "minLength": 1,
+      "pattern": "^[^\\\\/\\x00-\\x1f<>:\"|?*]+$",
       "title": "Evidence Id",
       "type": "string"
     },

@@ -193,6 +193,14 @@ def test_cli_repair_audit_lock_takeover_and_rejects_invalid_stage_without_secret
         "--session-id", "replacement", "--reason", "test recovery", "--lease-seconds", "120",
     )
     assert takeover["details"]["takeover"]["old_lock_id"] == lock
+    events = repo.read_events()
+    takeover_events = [event for event in events if event.event_type == "lock_taken_over"]
+    assert len(takeover_events) == 1
+    assert takeover_events[0].before_revision == takeover_events[0].after_revision == 1
+    assert takeover_events[0].details["reason"] == "test recovery"
+    assert takeover_events[0].details["old_lock_id"] == lock
+    assert takeover_events[0].details["new_lock_id"] == takeover["details"]["lock"]["lock_id"]
+    assert _run_json("validate", "--project", str(root))["details"]["valid"] is True
     _release(root, takeover["details"]["lock"]["lock_id"])
 
 

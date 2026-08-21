@@ -307,6 +307,38 @@ def test_mutation_mutex_blocks_expired_takeover_until_original_commits(
     assert LockRecord.model_validate_json(manager.path.read_text(encoding="utf-8")) == results[0].lock
 
 
+def test_takeover_status_observes_old_or_new_lock_never_a_publication_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = [datetime(2026, 8, 20, tzinfo=timezone.utc)]
+    manager = LockManager(tmp_path, now_fn=lambda: current[0])
+    old = manager.acquire(owner("old"), 0, timedelta(seconds=1))
+    current[0] += timedelta(seconds=2)
+    entered_replace = Event()
+    allow_replace = Event()
+    original_write = locks.atomic_write_json
+    result: list[object] = []
+
+    def pause_atomic_replace(path: Path, payload: dict) -> None:
+        entered_replace.set()
+        assert allow_replace.wait(timeout=5)
+        original_write(path, payload)
+
+    monkeypatch.setattr(locks, "atomic_write_json", pause_atomic_replace)
+
+    def take_over() -> None:
+        result.append(manager.takeover(old.lock_id, owner("new"), 0, "expired", timedelta(minutes=1)))
+
+    worker = Thread(target=take_over)
+    worker.start()
+    assert entered_replace.wait(timeout=5)
+    assert manager.status() == old
+    allow_replace.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert manager.status() == result[0].lock
+
+
 def test_heartbeat_and_release_are_serialized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

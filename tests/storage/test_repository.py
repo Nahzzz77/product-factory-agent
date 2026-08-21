@@ -64,6 +64,19 @@ def test_save_state_rejects_stale_expected_revision(tmp_path: Path) -> None:
     assert caught.value.code == "revision_conflict"
 
 
+@pytest.mark.parametrize("evidence_id", ["CON", "con.txt", "evidence:01", "name.", "trailing "])
+def test_evidence_identifiers_are_portable_path_components(tmp_path: Path, evidence_id: str) -> None:
+    repo = ProjectRepository(tmp_path)
+    with pytest.raises(FactoryError) as caught:
+        repo.evidence_path("stage-01", evidence_id)
+    assert caught.value.code == "evidence_identifier_invalid"
+
+
+def test_evidence_identifier_accepts_unicode_portable_name(tmp_path: Path) -> None:
+    repo = ProjectRepository(tmp_path)
+    assert repo.evidence_path("stage-01", "证据-01").name == "manifest.json"
+
+
 def test_repository_construction_is_read_only_for_missing_and_existing_paths(tmp_path: Path) -> None:
     missing = tmp_path / "missing-project"
     ProjectRepository(missing)

@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from product_factory.contracts.identifiers import is_portable_path_component
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -228,7 +230,22 @@ class KnownIssue(StrictModel):
 
 class EvidenceManifest(StrictModel):
     schema_version: Literal["1.0"]
-    evidence_id: str
+    evidence_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r'^[^\\/\x00-\x1f<>:"|?*]+$',
+        json_schema_extra={
+            "allOf": [
+                {"not": {"enum": [".", ".."]}},
+                {"not": {"pattern": r"[. ]$"}},
+                {
+                    "not": {
+                        "pattern": r"^(?i:(con|prn|aux|nul|com[1-9]|lpt[1-9]))(?:\..*)?$"
+                    }
+                }
+            ]
+        },
+    )
     stage_id: str
     state_revision: int
     factory_version: str
@@ -238,6 +255,12 @@ class EvidenceManifest(StrictModel):
     checks: list[EvidenceCheck] = Field(min_length=1)
     known_issues: list[KnownIssue] = Field(default_factory=list)
     ready_for_human_acceptance: bool
+
+    @model_validator(mode="after")
+    def require_portable_evidence_id(self):
+        if not is_portable_path_component(self.evidence_id):
+            raise ValueError("evidence_id must be a portable path component")
+        return self
 
 
 class ResultEnvelope(StrictModel):

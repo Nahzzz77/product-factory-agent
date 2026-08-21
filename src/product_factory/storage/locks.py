@@ -171,6 +171,8 @@ class LockManager:
         state_revision: int,
         reason: str,
         lease: timedelta,
+        *,
+        on_committed: Callable[[LockRecord, LockRecord, str], None] | None = None,
     ) -> TakeoverResult:
         self._require_positive_lease(lease)
         if not reason.strip():
@@ -226,6 +228,12 @@ class LockManager:
                 )
             replacement = self._new_record(owner, state_revision, lease)
             self._replace_expired_lock(replacement)
+            # The callback deliberately runs before the SQLite transaction is
+            # released.  CLI audit appends therefore cannot be interleaved with
+            # any other protocol mutation.  Its own business I/O errors retain
+            # their original type and are never translated into mutex failures.
+            if on_committed is not None:
+                on_committed(old, replacement, reason)
             return TakeoverResult(
                 lock=replacement,
                 details={
@@ -309,13 +317,10 @@ class LockManager:
         atomic_write_json(self.path, record.model_dump(mode="json"))
 
     def _replace_expired_lock(self, replacement: LockRecord) -> None:
-        try:
-            self.path.unlink()
-            _fsync_parent_directory(self.path)
-        except FileNotFoundError as exc:
-            raise self._takeover_changed() from exc
-        if not self._exclusive_create_record(self.path, replacement):
-            raise self._lock_held()
+        # The old, validated canonical file stays readable until the complete
+        # replacement is fsynced and renamed into place.  A concurrent status
+        # reader can consequently observe only the old or the new lease.
+        atomic_write_json(self.path, replacement.model_dump(mode="json"))
 
     def _exclusive_create_payload(self, path: Path, payload: dict[str, Any]) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)

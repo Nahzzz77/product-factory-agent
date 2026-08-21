@@ -6,16 +6,17 @@ import os
 import socket
 import sys
 from contextlib import contextmanager, redirect_stdout
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, Sequence
+from uuid import uuid4
 
 from pydantic import ValidationError
 
 from product_factory.cli.output import failure, internal_failure, render, success
 from product_factory.cli.parser import ArgumentParseError, build_parser
-from product_factory.contracts.models import GateType, LockOwner
+from product_factory.contracts.models import EventRecord, GateType, LockOwner, LockRecord
 from product_factory.errors import ErrorCategory, FactoryError
 from product_factory.services.evidence import record_evidence, verify_stage
 from product_factory.services.initialize import check_inputs, initialize_project
@@ -146,12 +147,62 @@ def _dispatch_lock(args: Any, root: Path):
         manager.release(args.lock_id)
         return success("lock_released", "执行锁已释放", "其他会话现在可以获取锁", {})
     if args.lock_command == "takeover":
+        repo = _takeover_repository(root)
+        project = repo.load_project()
+        state = repo.load_state()
+        if project.project_id != state.project_id:
+            raise FactoryError(
+                "project_identity_mismatch", ErrorCategory.ENVIRONMENT_BLOCKED,
+                "项目状态与项目元数据的标识不一致", "lock takeover", False,
+                "修复项目元数据后重试",
+            )
+
+        def append_takeover_audit(old: LockRecord, replacement: LockRecord, reason: str) -> None:
+            details = {
+                "old_lock_id": old.lock_id,
+                "new_lock_id": replacement.lock_id,
+                "reason": reason,
+                "old_owner": old.owner.model_dump(mode="json"),
+                "new_owner": replacement.owner.model_dump(mode="json"),
+                "old_acquired_at": old.acquired_at.isoformat(),
+                "old_lease_expires_at": old.lease_expires_at.isoformat(),
+                "new_acquired_at": replacement.acquired_at.isoformat(),
+                "new_lease_expires_at": replacement.lease_expires_at.isoformat(),
+            }
+            try:
+                repo.append_event(EventRecord(
+                    schema_version="1.0", event_id=str(uuid4()), event_type="lock_taken_over",
+                    project_id=project.project_id, before_revision=state.revision,
+                    after_revision=state.revision, created_at=datetime.now(timezone.utc), details=details,
+                ))
+            except OSError as exc:
+                raise FactoryError(
+                    "takeover_audit_failed", ErrorCategory.ENVIRONMENT_BLOCKED,
+                    "执行锁已接管，但接管审计未能写入", "lock takeover", True,
+                    "修复审计存储后运行 validate；保留新锁 ID 以继续恢复",
+                    details,
+                ) from exc
+
         result = manager.takeover(
-            args.old_lock_id, _owner(args.tool, args.session_id), _state_revision(root), args.reason,
-            _lease(args.lease_seconds),
+            args.old_lock_id, _owner(args.tool, args.session_id), state.revision, args.reason,
+            _lease(args.lease_seconds), on_committed=append_takeover_audit,
         )
         return success("lock_taken_over", "已接管过期执行锁", "使用新锁 ID 继续操作", {"lock": result.lock, "takeover": result.details})
     raise RuntimeError("unreachable lock command")
+
+
+def _takeover_repository(root: Path) -> ProjectRepository:
+    repo = _repository_or_error(root, "lock takeover")
+    try:
+        repo.load_project()
+        repo.load_state()
+    except (OSError, UnicodeDecodeError, ValueError, ValidationError) as exc:
+        raise FactoryError(
+            "project_protocol_invalid", ErrorCategory.ENVIRONMENT_BLOCKED,
+            "项目协议记录无效，不能审计接管执行锁", "lock takeover", False,
+            "先运行 validate 并修复项目协议记录",
+        ) from exc
+    return repo
 
 
 def _parse_stage(value: str) -> tuple[str, str, bool]:

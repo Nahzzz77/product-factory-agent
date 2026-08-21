@@ -84,7 +84,7 @@ def _read_fallback_contained_file(root: Path, candidate: Path) -> bytes:
         if stat.S_ISLNK(before.st_mode):
             raise ValueError("symlink is not a regular file")
         _require_contained(root, candidate.resolve(strict=True))
-        descriptor = os.open(candidate, _file_read_flags())
+        descriptor = os.open(candidate, _file_read_flags() | getattr(os, "O_NONBLOCK", 0))
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise ValueError("not a regular file")

@@ -1,5 +1,8 @@
 import os
+import json
 from pathlib import Path
+
+import yaml
 
 from product_factory.contracts.models import (
     ApprovalRecord,
@@ -10,15 +13,14 @@ from product_factory.contracts.models import (
     StateRecord,
 )
 from product_factory.errors import ErrorCategory, FactoryError
+from product_factory.contracts.identifiers import is_portable_path_component
 from product_factory.storage.files import (
     _fsync_parent_directory,
     append_jsonl,
     atomic_write_json,
     atomic_write_yaml,
     contained_path,
-    load_json,
-    load_yaml,
-    read_jsonl,
+    read_contained_regular_bytes,
 )
 from product_factory.storage.paths import ProjectPaths
 
@@ -28,7 +30,7 @@ class ProjectRepository:
         self.paths = ProjectPaths(root.resolve())
 
     def load_state(self) -> StateRecord:
-        return StateRecord.model_validate_json(self.paths.state.read_text(encoding="utf-8"))
+        return StateRecord.model_validate_json(self._read_protocol_bytes(self.paths.state))
 
     def write_initial_state(self, state: StateRecord) -> None:
         if self.paths.state.exists():
@@ -59,10 +61,10 @@ class ProjectRepository:
         return next_state
 
     def load_project(self) -> ProjectRecord:
-        return ProjectRecord.model_validate(load_yaml(self.paths.project))
+        return ProjectRecord.model_validate(yaml.safe_load(self._read_protocol_bytes(self.paths.project)))
 
     def load_intake(self) -> IntakeRecord:
-        return IntakeRecord.model_validate(load_yaml(self.paths.intake))
+        return IntakeRecord.model_validate(yaml.safe_load(self._read_protocol_bytes(self.paths.intake)))
 
     def save_project(self, record: ProjectRecord) -> None:
         atomic_write_yaml(self.paths.project, record.model_dump(mode="json"))
@@ -74,13 +76,13 @@ class ProjectRepository:
         append_jsonl(self.paths.approvals, record.model_dump(mode="json"))
 
     def read_approvals(self) -> list[ApprovalRecord]:
-        return [ApprovalRecord.model_validate(item) for item in read_jsonl(self.paths.approvals)]
+        return [ApprovalRecord.model_validate(item) for item in self._read_jsonl(self.paths.approvals)]
 
     def append_event(self, record: EventRecord) -> None:
         append_jsonl(self.paths.events, record.model_dump(mode="json"))
 
     def read_events(self) -> list[EventRecord]:
-        return [EventRecord.model_validate(item) for item in read_jsonl(self.paths.events)]
+        return [EventRecord.model_validate(item) for item in self._read_jsonl(self.paths.events)]
 
     def evidence_path(self, stage_id: str, evidence_id: str) -> Path:
         return self._evidence_directory(stage_id, evidence_id) / "manifest.json"
@@ -112,10 +114,10 @@ class ProjectRepository:
         return path
 
     def load_evidence(self, stage_id: str, evidence_id: str) -> EvidenceManifest:
-        return EvidenceManifest.model_validate(load_json(self.evidence_path(stage_id, evidence_id)))
+        return EvidenceManifest.model_validate_json(self._read_protocol_bytes(self.evidence_path(stage_id, evidence_id)))
 
     def _evidence_directory(self, stage_id: str, evidence_id: str) -> Path:
-        if not _is_path_component(stage_id) or not _is_path_component(evidence_id):
+        if not is_portable_path_component(stage_id) or not is_portable_path_component(evidence_id):
             raise FactoryError(
                 "evidence_identifier_invalid",
                 ErrorCategory.INPUT_REQUIRED,
@@ -126,6 +128,18 @@ class ProjectRepository:
             )
         return contained_path(self.paths.evidence, f"{stage_id}/{evidence_id}")
 
+    def _read_protocol_bytes(self, path: Path) -> bytes:
+        if not path.exists():
+            raise FileNotFoundError(path)
+        relative = path.relative_to(self.paths.root)
+        return read_contained_regular_bytes(self.paths.root, relative.parts)
 
-def _is_path_component(value: str) -> bool:
-    return bool(value) and value not in {".", ".."} and "/" not in value and "\\" not in value
+    def _read_jsonl(self, path: Path) -> list[dict]:
+        raw = self._read_protocol_bytes(path).decode("utf-8")
+        records: list[dict] = []
+        for number, line in enumerate(raw.splitlines(), start=1):
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{number}") from exc
+        return records
