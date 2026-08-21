@@ -320,8 +320,11 @@ def _validate_evidence(
     except (ValueError, ValidationError):
         _add(findings, "referenced_evidence_invalid")
         return
-    except (OSError, FactoryError):
+    except OSError:
         _add(findings, "referenced_evidence_unverifiable")
+        return
+    except FactoryError as exc:
+        _add_evidence_factory_error(findings, exc)
         return
     identity_invalid = False
     if manifest.evidence_id != state.last_valid_evidence_id:
@@ -339,8 +342,28 @@ def _validate_evidence(
         digest = compute_source_digest(repo.paths.root, project.source_excludes)
         if evaluate_evidence(manifest, project, state, digest):
             _add(findings, "stale_referenced_evidence")
-    except (FactoryError, OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError):
         _add(findings, "referenced_evidence_unverifiable")
+    except FactoryError as exc:
+        _add_evidence_factory_error(findings, exc)
+
+
+def _add_evidence_factory_error(findings: list[str], error: FactoryError) -> None:
+    """Classify deterministic protocol errors separately from transient reads.
+
+    Repository input/policy errors describe an invalid reference (for example a
+    path-traversal evidence ID), so they must not look like a retryable storage
+    outage.  The explicitly retryable environment category is reserved for
+    unstable digest/source observations; unknown FactoryErrors default to the
+    conservative invalid result.
+    """
+    if error.code == "evidence_identifier_invalid":
+        _add(findings, "referenced_evidence_invalid")
+        return
+    if error.category is ErrorCategory.ENVIRONMENT_BLOCKED and error.retryable:
+        _add(findings, "referenced_evidence_unverifiable")
+        return
+    _add(findings, "referenced_evidence_invalid")
 
 
 def _lock_status(root: Path) -> str:

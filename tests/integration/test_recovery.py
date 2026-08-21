@@ -213,11 +213,29 @@ def test_resume_reports_unverifiable_evidence_without_mutation_guidance(
         "checks": [{"name": "check", "command": "true", "started_at": "2026-08-20T00:00:00Z", "ended_at": "2026-08-20T00:00:01Z", "exit_status": 0, "summary": "ok", "mode": "mock"}],
         "ready_for_human_acceptance": True,
     }), encoding="utf-8")
-    monkeypatch.setattr(recovery, "compute_source_digest", lambda *_args: (_ for _ in ()).throw(
-        FactoryError("source_digest_unstable", ErrorCategory.ENVIRONMENT_BLOCKED, "unstable", "digest", True, "retry")
-    ))
+    monkeypatch.setattr(
+        recovery,
+        "compute_source_digest",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("digest worker interrupted")),
+    )
     summary = recovery.resume_project(root)
     assert summary.evidence_status == "unverifiable"
+    assert summary.next_command == "product-factory validate"
+
+
+def test_recovery_marks_invalid_evidence_identifier_as_invalid(tmp_path: Path) -> None:
+    from product_factory.services.recovery import resume_project, validate_project
+
+    root = _root(tmp_path)
+    repo = ProjectRepository(root)
+    state = repo.load_state()
+    repo.save_state(state.model_copy(update={"revision": 1, "last_valid_evidence_id": "../escape"}), 0)
+
+    report = validate_project(root)
+    assert "referenced_evidence_invalid" in report.findings
+    assert "referenced_evidence_unverifiable" not in report.findings
+    summary = resume_project(root)
+    assert summary.evidence_status == "invalid"
     assert summary.next_command == "product-factory validate"
 
 
