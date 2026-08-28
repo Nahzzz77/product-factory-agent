@@ -40,6 +40,7 @@ echo "正在组装 macOS 安装包……"
 /bin/cp scripts/install_macos.command "$package_root/安装产品工厂.command"
 /bin/chmod +x "$package_root/安装产品工厂.command"
 /bin/cp RELEASE-README.txt "$package_root/使用说明.txt"
+/bin/cp LICENSE "$package_root/LICENSE"
 
 echo "正在检查隐私边界……"
 if find "$package_root" \( \

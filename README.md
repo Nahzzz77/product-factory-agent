@@ -158,3 +158,7 @@ cp examples/minimal-project/evidence-manifest.yaml /tmp/minimal-web/evidence-aut
 ## 验证范围
 
 本版本已在 macOS 上用本地 Python 3.12 环境完成自动化和真实 Chromium 验证。Windows 与 Linux 按文件协议和路径规则设计为兼容，但未进行实机验证。后续协议状态可以被校验，但不是本版本可执行的转换。Codex 任务需要本机已经安装、登录且能够访问相应模型服务；其网络与用量由用户自己的 Codex 配置决定。
+
+## 许可证
+
+本项目及仓库内配套文档采用 [MIT License](LICENSE)，版权所有 © 2026 Nahzzz77。
