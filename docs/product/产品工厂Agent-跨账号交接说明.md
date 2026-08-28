@@ -13,11 +13,11 @@
 
 PRD 文件路径：
 
-`/Users/mixingtumima0000/Desktop/项目制作/docs/产品工厂Agent-PRD-V1.0.md`
+`docs/product/产品工厂Agent-PRD-V1.0.md`
 
 当前这份交接说明路径：
 
-`/Users/mixingtumima0000/Desktop/项目制作/docs/产品工厂Agent-跨账号交接说明.md`
+`docs/product/产品工厂Agent-跨账号交接说明.md`
 
 ## 已确认的产品定义
 
@@ -137,9 +137,9 @@ human_accepted    产品经理已经实际操作并批准
 
 以下三份手册被阅读并作为工程规则输入。它们不等于本项目的产品需求，也不自动授权任何外部操作：
 
-1. `/Users/mixingtumima0000/Desktop/新能源agent项目/AI产品Vibe Coding通用技术栈手册.md`
-2. `/Users/mixingtumima0000/Desktop/新能源agent项目/AI产品Vibe Coding通用前端技术栈手册.md`
-3. `/Users/mixingtumima0000/Desktop/新能源agent项目/AI Agent 产品上线部署手册(1).md`
+1. `references/handbooks/AI产品Vibe Coding通用技术栈手册.md`
+2. `references/handbooks/AI产品Vibe Coding通用前端技术栈手册.md`
+3. `references/handbooks/AI Agent 产品上线部署手册(1).md`
 
 ## 给新 AI 账号的工作指令
 

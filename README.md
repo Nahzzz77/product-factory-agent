@@ -6,6 +6,20 @@
 
 ## 安装
 
+### 普通用户安装（macOS）
+
+从 GitHub Releases 下载 `product-factory-agent-0.2.0-macos.zip`，解压后双击 `安装产品工厂.command`。安装程序需要本机已有 Python 3.11 或更高版本，并在首次安装时联网下载基础依赖。
+
+程序与用户数据严格分开：
+
+- 应用安装到 `~/Applications/产品工厂.app`；
+- 程序运行环境安装到 `~/Library/Application Support/ProductFactory`；
+- 用户创建的产品项目只保存在 `~/ProductFactoryProjects`。
+
+发布 ZIP、Python wheel 和 GitHub 源码仓库都不包含用户项目、运行记录、审批记录或生成结果。重新安装或升级程序不会覆盖 `~/ProductFactoryProjects`。
+
+### 开发环境安装
+
 在 Python 3.11 或更高版本的本地环境中运行：
 
 ```bash
@@ -20,9 +34,9 @@ python3 -m venv .venv
 
 ### 双击启动（macOS）
 
-在 Finder 中打开本项目文件夹，双击 `产品工厂.app`。它会在后台启动本地服务并打开浏览器，不需要终端窗口，项目默认保存到 `~/ProductFactoryProjects`。
+安装完成后，在 Finder 的个人目录中打开 `Applications`，双击 `产品工厂.app`。它会在后台启动本地服务并打开浏览器，不需要终端窗口，项目默认保存到 `~/ProductFactoryProjects`。
 
-`src/product_factory/web/static/index.html` 是内部网页源码，不是产品启动入口。如果误点该文件，页面会明确提示返回 Finder 并使用上述应用。开发者更新代码后，可运行 `scripts/build_macos_app.sh` 重新生成自包含的 macOS 应用。
+`src/product_factory/web/static/index.html` 是内部网页源码，不是产品启动入口。如果误点该文件，页面会明确提示返回 Finder 并使用上述应用。开发者可以运行 `scripts/build_macos_app.sh` 生成本机开发应用，或运行 `scripts/package_release.sh` 生成可发布的安装 ZIP 和 Python wheel。
 
 macOS 首次可能会确认本地应用。可在 Finder 中右键该应用，选择“打开”并确认。
 

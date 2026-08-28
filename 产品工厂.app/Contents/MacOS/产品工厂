@@ -8,8 +8,9 @@ user_home=${HOME:-"/Users/$current_user"}
 workspace_dir=${PRODUCT_FACTORY_WORKSPACE:-"$user_home/ProductFactoryProjects"}
 workspace_port=${PRODUCT_FACTORY_PORT:-0}
 no_open=${PRODUCT_FACTORY_NO_OPEN:-0}
-runtime_python="$bundle_dir/Contents/Resources/runtime/bin/python"
-application_root="$bundle_dir/Contents/Resources/application"
+installed_runtime="$user_home/Library/Application Support/ProductFactory/runtime/bin/python"
+bundled_runtime="$bundle_dir/Contents/Resources/runtime/bin/python"
+bundled_application="$bundle_dir/Contents/Resources/application"
 log_dir="$user_home/Library/Logs/ProductFactory"
 log_file="$log_dir/web-launcher.log"
 
@@ -28,8 +29,14 @@ if ! /bin/mkdir -p "$log_dir"; then
   exit 1
 fi
 
-if [[ ! -x "$runtime_python" || ! -d "$application_root/product_factory" ]]; then
-  show_error "产品工厂应用不完整，请重新生成应用包。"
+if [[ -x "$installed_runtime" ]]; then
+  runtime_python="$installed_runtime"
+  application_root=""
+elif [[ -x "$bundled_runtime" && -d "$bundled_application/product_factory" ]]; then
+  runtime_python="$bundled_runtime"
+  application_root="$bundled_application"
+else
+  show_error "产品工厂运行环境不存在，请重新运行安装程序。"
   exit 1
 fi
 
@@ -49,9 +56,15 @@ if [[ "$no_open" == "1" ]]; then
   launcher_args+=(--no-open)
 fi
 
-PYTHONPATH="$application_root" PYTHONNOUSERSITE=1 "$runtime_python" -c \
-  'from product_factory.cli.main import main; raise SystemExit(main())' \
-  "${launcher_args[@]}" >> "$log_file" 2>&1
+if [[ -n "$application_root" ]]; then
+  PYTHONPATH="$application_root" PYTHONNOUSERSITE=1 "$runtime_python" -c \
+    'from product_factory.cli.main import main; raise SystemExit(main())' \
+    "${launcher_args[@]}" >> "$log_file" 2>&1
+else
+  PYTHONNOUSERSITE=1 "$runtime_python" -c \
+    'from product_factory.cli.main import main; raise SystemExit(main())' \
+    "${launcher_args[@]}" >> "$log_file" 2>&1
+fi
 exit_code=$?
 
 if (( exit_code != 0 && exit_code != 1 && exit_code != 129 && exit_code != 130 && exit_code != 143 )); then
